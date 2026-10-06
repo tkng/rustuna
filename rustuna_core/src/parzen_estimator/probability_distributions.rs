@@ -258,7 +258,58 @@ impl DiscreteTruncLogNormDistributions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CategoricalDistributions {
-    pub weights: Vec<Vec<f64>>,
+    // Each observation contributes a uniform mass plus a spike at its category.
+    // The final kernel is the uniform prior. Joint mixtures retain row identity.
+    observed_categories: Vec<usize>,
+    cardinality: usize,
+    matching: f64,
+    other: f64,
+}
+
+impl CategoricalDistributions {
+    pub(crate) fn new(observations: &[f64], cardinality: usize) -> Self {
+        assert!(cardinality > 0, "Categorical cardinality must be positive");
+        let observed_categories = observations
+            .iter()
+            .map(|&value| {
+                let category = value as usize;
+                assert!(category < cardinality, "Observed category is out of range");
+                category
+            })
+            .collect();
+        let prior_mass = 1.0 / (observations.len() + 1) as f64;
+        let denominator = 1.0 + cardinality as f64 * prior_mass;
+        let matching = (1.0 + prior_mass) / denominator;
+        let other = prior_mass / denominator;
+        Self {
+            observed_categories,
+            cardinality,
+            matching,
+            other,
+        }
+    }
+
+    fn probability(&self, kernel: usize, category: usize) -> f64 {
+        match self.observed_categories.get(kernel) {
+            Some(&observed) if observed == category => self.matching,
+            Some(_) => self.other,
+            None => 1.0 / self.cardinality as f64,
+        }
+    }
+
+    fn accumulate_log_pdf(&self, category: usize, scores: &mut [f64]) {
+        debug_assert_eq!(scores.len(), self.observed_categories.len() + 1);
+        let log_matching = self.matching.ln();
+        let log_other = self.other.ln();
+        for (&observed, score) in self.observed_categories.iter().zip(scores.iter_mut()) {
+            *score += if observed == category {
+                log_matching
+            } else {
+                log_other
+            };
+        }
+        *scores.last_mut().unwrap() += (1.0 / self.cardinality as f64).ln();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -380,15 +431,19 @@ impl MixtureOfProductDistribution {
                         sample.insert(param.clone(), discrete_value);
                     }
                     Distributions::Categorical(d) => {
-                        let probs = &d.weights[k];
-                        let sum: f64 = probs.iter().sum();
-                        assert!(sum > 0.0, "Categorical distribution has non-positive total probability for param {param}");
+                        let sum: f64 = (0..d.cardinality)
+                            .map(|category| d.probability(k, category))
+                            .sum();
+                        assert!(
+                            sum > 0.0,
+                            "Categorical distribution has non-positive total probability for param {param}"
+                        );
 
                         let u = rng.gen::<f64>() * sum;
                         let mut cum = 0.0;
-                        let mut chosen = (probs.len() - 1) as f64; // fallback
-                        for (category, &p) in probs.iter().enumerate() {
-                            cum += p;
+                        let mut chosen = (d.cardinality - 1) as f64; // fallback
+                        for category in 0..d.cardinality {
+                            cum += d.probability(k, category);
                             if u <= cum {
                                 chosen = category as f64;
                                 break;
@@ -460,20 +515,10 @@ impl MixtureOfProductDistribution {
                 }
                 Distributions::Categorical(d) => {
                     let xi = x_val as usize;
-                    for (k, weight) in weighted_log_pdf.iter_mut().enumerate().take(n) {
-                        if *weight == f64::NEG_INFINITY {
-                            continue;
-                        }
-                        if xi >= d.weights[k].len() {
-                            return f64::NEG_INFINITY;
-                        }
-                        let p = d.weights[k][xi];
-                        if p <= 0.0 {
-                            *weight = f64::NEG_INFINITY;
-                        } else {
-                            *weight += p.ln();
-                        }
+                    if xi >= d.cardinality {
+                        return f64::NEG_INFINITY;
                     }
+                    d.accumulate_log_pdf(xi, &mut weighted_log_pdf);
                 }
             }
         }
@@ -537,12 +582,7 @@ mod tests {
             5.0,
             1.0,
         );
-        let categorical_dist = CategoricalDistributions {
-            weights: vec![
-                vec![0.9, 0.1], // vec.len() == cardinality
-                vec![0.5, 0.5], // uniform prior
-            ], // weigths.len() == mus.len()
-        };
+        let categorical_dist = CategoricalDistributions::new(&[0.0], 2);
         let distributions = vec![
             (
                 "param_truncnorm".to_string(),
@@ -585,5 +625,79 @@ mod tests {
             let val_categorical = sample.get("param_categorical").unwrap();
             assert!(*val_categorical == 0.0 || *val_categorical == 1.0);
         }
+    }
+
+    #[test]
+    fn categorical_kernels_keep_smoothed_probabilities_and_uniform_prior() {
+        let distribution = CategoricalDistributions::new(&[1.0, 2.0], 3);
+        let expected = [
+            [1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0],
+            [1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0],
+            [1.0 / 3.0; 3],
+        ];
+        for (category, _) in expected[0].iter().enumerate() {
+            let mut scores = vec![0.0; 3];
+            distribution.accumulate_log_pdf(category, &mut scores);
+            for (kernel, (row, score)) in expected.iter().zip(scores).enumerate() {
+                assert!((distribution.probability(kernel, category) - row[category]).abs() < 1e-15);
+                assert!((score - row[category].ln()).abs() < 1e-15);
+            }
+        }
+        for cardinality in [1, 3, 257] {
+            let prior = CategoricalDistributions::new(&[], cardinality);
+            let singleton = CategoricalDistributions::new(&[0.0; 10], 1);
+            let mut scores = vec![0.0; 1];
+            prior.accumulate_log_pdf(0, &mut scores);
+            assert_eq!(prior.probability(0, 0), 1.0 / cardinality as f64);
+            assert_eq!(scores[0], (1.0 / cardinality as f64).ln());
+            assert_eq!(singleton.probability(0, 0), 1.0);
+        }
+    }
+
+    #[test]
+    fn categorical_joint_density_keeps_observation_correlations_and_weights() {
+        let mixture = MixtureOfProductDistribution::new(
+            HashMap::from([
+                (
+                    "x".into(),
+                    Distributions::Categorical(CategoricalDistributions::new(&[0.0, 1.0], 2)),
+                ),
+                (
+                    "y".into(),
+                    Distributions::Categorical(CategoricalDistributions::new(&[0.0, 1.0], 2)),
+                ),
+            ]),
+            vec![1.0, 2.0, 0.5],
+        );
+        let matching = 4.0_f64 / 5.0;
+        let other = 1.0_f64 / 5.0;
+        for (x, y) in [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)] {
+            let likelihood = (if x == 0.0 { matching } else { other })
+                * (if y == 0.0 { matching } else { other })
+                + 2.0
+                    * (if x == 1.0 { matching } else { other })
+                    * (if y == 1.0 { matching } else { other })
+                + 0.5 * 0.25;
+            let actual = mixture.log_pdf(&HashMap::from([("x".into(), x), ("y".into(), y)]));
+            assert!((actual - (likelihood / 3.5).ln()).abs() < 1e-14);
+        }
+        assert_eq!(
+            mixture.log_pdf(&HashMap::from([("x".into(), 2.0), ("y".into(), 0.0)])),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(
+            mixture.log_pdf(&HashMap::from([("x".into(), 0.0)])),
+            f64::NEG_INFINITY
+        );
+        let mut rng = StdRng::seed_from_u64(42);
+        let samples = mixture.sample(&mut rng, 20_000);
+        let equal = samples
+            .iter()
+            .filter(|sample| sample["x"] == sample["y"])
+            .count() as f64
+            / samples.len() as f64;
+        // Both observed kernels give P(x=y)=0.8^2+0.2^2; the prior gives 0.5.
+        let expected_equal = (3.0 * (matching * matching + other * other) + 0.5 * 0.5) / 3.5;
+        assert!((equal - expected_equal).abs() < 0.015);
     }
 }
