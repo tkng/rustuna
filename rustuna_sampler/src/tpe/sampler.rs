@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -10,7 +11,7 @@ use rustuna_core::internal::parzen_estimator::ParzenEstimator;
 use rustuna_core::sampler::{Context, RandomSampler, Sampler};
 use rustuna_core::storage::Storage;
 use rustuna_core::study::Direction;
-use rustuna_core::trial::TrialStateValues;
+use rustuna_core::trial::{PersistedTrial, TrialState, TrialStateValues};
 use rustuna_core::Result;
 use rustuna_core::{Error, ErrorKind};
 
@@ -84,16 +85,90 @@ impl TpeBuilder {
             n_startup_trials: self.n_startup_trials,
             random_sampler: RandomSampler::seed_from_u64(seed_for_random_sampler),
             split_cache: RwLock::new(HashMap::new()),
-            observations_cache: RwLock::new(HashMap::new()),
+            observations_cache: RwLock::new(ObservationsCache::default()),
         }
     }
 }
 
 type SplitKey = (Vec<u32>, usize);
 type SplitValue = (HashSet<u32>, HashSet<u32>);
-/// Keyed by `(study_id, trial_id)`; `None` records that fewer than
-/// `n_startup_trials` usable completed trials existed when the trial started.
-type ObservationsCache = HashMap<(u32, u32), Option<Arc<TpeObservationSet>>>;
+/// Identity of the storage allocation that owns a study's trial IDs.
+#[derive(Clone)]
+struct StorageKey(Weak<RwLock<dyn Storage>>);
+
+impl PartialEq for StorageKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+impl Eq for StorageKey {}
+impl Hash for StorageKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // The Weak owns the allocation identity until this key is removed.
+        (self.0.as_ptr() as *const ()).hash(state);
+    }
+}
+
+#[derive(Default)]
+struct ObservationsCache {
+    per_trial: HashMap<(StorageKey, u32, u32), Option<Arc<TpeObservationSet>>>,
+    studies: HashMap<(StorageKey, u32), StudyObservations>,
+    next_use: u64,
+}
+
+struct StudyObservations {
+    seen: Vec<Option<(u32, u32, TrialState)>>,
+    observations: Arc<TpeObservationSet>,
+    last_used: u64,
+}
+
+impl StudyObservations {
+    fn new(n_objectives: usize) -> Self {
+        Self {
+            seen: Vec::new(),
+            observations: Arc::new(TpeObservationSet {
+                trial_numbers: Vec::new(),
+                values: Vec::new(),
+                n_objectives,
+                param_columns: HashMap::new(),
+                feasibles_violations: Vec::new(),
+            }),
+            last_used: 0,
+        }
+    }
+
+    fn update(&mut self, trials: &[Option<PersistedTrial>]) -> Result<()> {
+        for old in self.seen.iter().skip(trials.len()).flatten() {
+            Arc::make_mut(&mut self.observations).remove(old.1);
+        }
+        self.seen.resize(trials.len(), None);
+        for (index, trial) in trials.iter().enumerate() {
+            let stamp = trial
+                .as_ref()
+                .map(|t| (t.id, t.number, t.state_values.state()));
+            if self.seen[index] == stamp {
+                continue;
+            }
+            if let Some((_, number, _)) = self.seen[index] {
+                if self
+                    .observations
+                    .trial_numbers
+                    .binary_search(&number)
+                    .is_ok()
+                {
+                    Arc::make_mut(&mut self.observations).remove(number);
+                }
+            }
+            if let Some(trial) = trial {
+                if matches!(trial.state_values, TrialStateValues::Complete(_)) {
+                    Arc::make_mut(&mut self.observations).insert(trial)?;
+                }
+            }
+            self.seen[index] = stamp;
+        }
+        Ok(())
+    }
+}
 
 /// Upper bound on cached per-trial snapshots; trials returned from `ask` that
 /// never reach `tell` would otherwise leak their entry.
@@ -105,6 +180,7 @@ const OBSERVATIONS_CACHE_CAP: usize = 64;
 /// snapshot is search-space independent: it carries a column for every
 /// parameter observed in a usable completed trial, so one copy per trial
 /// serves every suggestion of that trial.
+#[derive(Clone)]
 struct TpeObservationSet {
     trial_numbers: Vec<u32>,
     /// Objective values, `n_objectives` slots per row.
@@ -129,6 +205,64 @@ struct TpeObservationsView<'a> {
 }
 
 impl TpeObservationSet {
+    fn insert(&mut self, trial: &PersistedTrial) -> Result<()> {
+        let TrialStateValues::Complete(values) = &trial.state_values else {
+            return Ok(());
+        };
+        if values.iter().any(|x| x.is_nan()) {
+            return Ok(());
+        }
+        if values.len() != self.n_objectives {
+            return Err(Error::with_reason(
+                ErrorKind::Unexpected,
+                format!(
+                    "Trial {} has {} objective values but the study has {} directions",
+                    trial.number,
+                    values.len(),
+                    self.n_objectives
+                ),
+            ));
+        }
+        let constraints = trial.constraints()?;
+        let feasible = constraints.values().all(|x| *x <= 0.0);
+        let violation = constraints.values().filter(|&x| *x > 0.0).sum::<f64>();
+        let row = self
+            .trial_numbers
+            .partition_point(|&number| number < trial.number);
+        self.trial_numbers.insert(row, trial.number);
+        self.values.splice(
+            row * self.n_objectives..row * self.n_objectives,
+            values.iter().copied(),
+        );
+        for column in self.param_columns.values_mut() {
+            column.insert(row, None);
+        }
+        for (name, &value) in &trial.internal_params {
+            if let Some(column) = self.param_columns.get_mut(name) {
+                column[row] = Some(value);
+            } else {
+                let mut column = vec![None; self.trial_numbers.len()];
+                column[row] = Some(value);
+                self.param_columns.insert(name.clone(), column);
+            }
+        }
+        self.feasibles_violations.insert(row, (feasible, violation));
+        Ok(())
+    }
+
+    fn remove(&mut self, number: u32) {
+        if let Ok(row) = self.trial_numbers.binary_search(&number) {
+            self.trial_numbers.remove(row);
+            self.values
+                .drain(row * self.n_objectives..(row + 1) * self.n_objectives);
+            self.feasibles_violations.remove(row);
+            self.param_columns.retain(|_, column| {
+                column.remove(row);
+                column.iter().any(Option::is_some)
+            });
+        }
+    }
+
     fn view(&self, search_space: &HashMap<String, Distribution>) -> TpeObservationsView<'_> {
         let mut sorted_keys: Vec<&String> = search_space.keys().collect();
         sorted_keys.sort();
@@ -219,9 +353,8 @@ pub struct TpeSampler {
     // TODO(y0z): Change to LruCache<(Vec<&PersistedTrial>, usize), (Vec<&PersistedTrial>, Vec<&PersistedTrial>)>
     split_cache: RwLock<HashMap<SplitKey, SplitValue>>,
     /// Per-trial snapshot built in `before_trial` and dropped in `after_trial`.
-    /// Locks are never nested: the storage guard is dropped before this lock
-    /// is taken, and the read guard is dropped (the `Arc` cloned out) before
-    /// the TPE model is built.
+    /// Study columns are retained between trials. Storage is locked before
+    /// this cache during updates; both are released before model construction.
     observations_cache: RwLock<ObservationsCache>,
 }
 impl Default for TpeSampler {
@@ -423,99 +556,14 @@ impl TpeSampler {
         (0.1 * n as f64).ceil() as usize
     }
 
-    /// Counts the trials that [`Self::snapshot_observation_set`] would
-    /// keep: only trials whose `Complete` values are fully finite-or-±inf.
-    /// Trials carrying NaN are dropped here, before the `n_startup_trials`
-    /// gate, so they neither inflate `gamma` nor leak into the good rows. In
-    /// the all-NaN / finite-count-below-startup case the short count naturally
-    /// falls through to the random sampler via the existing startup gate.
-    fn count_usable_complete_trials(
-        trials: &[Option<rustuna_core::trial::PersistedTrial>],
-    ) -> usize {
-        trials
-            .iter()
-            .flatten()
-            .filter(|t| match &t.state_values {
-                TrialStateValues::Complete(v) => !v.iter().any(|x| x.is_nan()),
-                _ => false,
-            })
-            .count()
-    }
-
-    /// Copies the usable completed trials (the same selection as
-    /// [`Self::count_usable_complete_trials`], in storage order) into owned
-    /// observations so the storage guard can be dropped before the TPE model
-    /// is built. `n_usable` is that count, used to size the buffers up front.
-    /// Every observed parameter is captured; constraint feasibility is
-    /// evaluated per trial.
-    fn snapshot_observation_set(
-        trials: &[Option<rustuna_core::trial::PersistedTrial>],
-        n_objectives: usize,
-        n_usable: usize,
-    ) -> Result<TpeObservationSet> {
-        let mut observations = TpeObservationSet {
-            trial_numbers: Vec::with_capacity(n_usable),
-            values: Vec::with_capacity(n_usable * n_objectives),
-            n_objectives,
-            param_columns: HashMap::new(),
-            feasibles_violations: Vec::with_capacity(n_usable),
-        };
-        for trial in trials.iter().flatten() {
-            let TrialStateValues::Complete(values) = &trial.state_values else {
-                continue;
-            };
-            if values.iter().any(|x| x.is_nan()) {
-                continue;
-            }
-            if values.len() != n_objectives {
-                return Err(Error::with_reason(
-                    ErrorKind::Unexpected,
-                    format!(
-                        "Trial {} has {} objective values but the study has {} directions",
-                        trial.number,
-                        values.len(),
-                        n_objectives
-                    ),
-                ));
-            }
-            let constraints = trial.constraints()?;
-            let feasible = constraints.values().all(|x| *x <= 0.0);
-            let violation = constraints.values().filter(|&x| *x > 0.0).sum::<f64>();
-            let row = observations.trial_numbers.len();
-            observations.trial_numbers.push(trial.number);
-            observations.values.extend_from_slice(values);
-            for (name, value) in &trial.internal_params {
-                if let Some(column) = observations.param_columns.get_mut(name) {
-                    column.resize(row, None);
-                    column.push(Some(*value));
-                } else {
-                    let mut column = Vec::with_capacity(n_usable);
-                    column.resize(row, None);
-                    column.push(Some(*value));
-                    observations.param_columns.insert(name.clone(), column);
-                }
-            }
-            observations
-                .feasibles_violations
-                .push((feasible, violation));
-        }
-        let n_rows = observations.trial_numbers.len();
-        for column in observations.param_columns.values_mut() {
-            column.resize(n_rows, None);
-        }
-        Ok(observations)
-    }
-
-    /// Snapshots the observations directly from the storage, or `None` while
-    /// the usable trial count is below `n_startup_trials`. The storage guard
-    /// is held only while copying; the TPE model construction runs without
-    /// any storage lock so concurrent trials can keep reading and writing the
-    /// storage meanwhile.
+    /// Refreshes study-local columns from changed trial states. Finished trials
+    /// are immutable under the Storage contract, so their parameter maps need
+    /// not be copied again. Each trial retains its own immutable Arc snapshot.
     fn snapshot_from_storage(
         &self,
         ctx: &Context,
         storage: &Arc<RwLock<dyn Storage>>,
-    ) -> Result<Option<TpeObservationSet>> {
+    ) -> Result<Option<Arc<TpeObservationSet>>> {
         let mut guard = storage.write().map_err(|e| {
             Error::with_reason(
                 ErrorKind::Unexpected,
@@ -523,15 +571,43 @@ impl TpeSampler {
             )
         })?;
         let trials = guard.get_trials(ctx.study_id)?;
-        let n_usable = Self::count_usable_complete_trials(trials);
-        if n_usable < self.n_startup_trials {
-            return Ok(None);
+        // Locks always follow storage -> observations. Model construction and
+        // cached snapshot reads hold neither lock while calling storage.
+        let mut cache = self.observations_cache.write().map_err(|e| {
+            Error::with_reason(
+                ErrorKind::SamplerError,
+                format!("Failed to acquire observations cache guard: {e}"),
+            )
+        })?;
+        cache
+            .studies
+            .retain(|(owner, _), _| owner.0.strong_count() > 0);
+        cache
+            .per_trial
+            .retain(|(owner, _, _), _| owner.0.strong_count() > 0);
+        let key = (StorageKey(Arc::downgrade(storage)), ctx.study_id);
+        cache.next_use = cache.next_use.wrapping_add(1);
+        let last_used = cache.next_use;
+        let history = cache
+            .studies
+            .entry(key.clone())
+            .or_insert_with(|| StudyObservations::new(ctx.directions.len()));
+        history.update(trials)?;
+        history.last_used = last_used;
+        let snapshot = (history.observations.trial_numbers.len() >= self.n_startup_trials)
+            .then(|| Arc::clone(&history.observations));
+        if cache.studies.len() > OBSERVATIONS_CACHE_CAP {
+            let oldest = cache
+                .studies
+                .iter()
+                .filter(|(candidate, _)| **candidate != key)
+                .min_by_key(|(_, history)| history.last_used)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                cache.studies.remove(&oldest);
+            }
         }
-        Ok(Some(Self::snapshot_observation_set(
-            trials,
-            ctx.directions.len(),
-            n_usable,
-        )?))
+        Ok(snapshot)
     }
 
     /// Returns the trial's cached snapshot, falling back to a direct storage
@@ -551,11 +627,16 @@ impl TpeSampler {
                     format!("Failed to acquire observations cache guard: {e}"),
                 )
             })?
-            .get(&(ctx.study_id, ctx.trial_id))
+            .per_trial
+            .get(&(
+                StorageKey(Arc::downgrade(storage)),
+                ctx.study_id,
+                ctx.trial_id,
+            ))
             .cloned();
         match cached {
             Some(observations) => Ok(observations),
-            None => Ok(self.snapshot_from_storage(ctx, storage)?.map(Arc::new)),
+            None => self.snapshot_from_storage(ctx, storage),
         }
     }
 
@@ -645,20 +726,32 @@ impl TpeSampler {
 
 impl Sampler for TpeSampler {
     fn before_trial(&self, ctx: &Context, storage: Arc<RwLock<dyn Storage>>) -> Result<()> {
-        let observations = self.snapshot_from_storage(ctx, &storage)?.map(Arc::new);
+        let observations = self.snapshot_from_storage(ctx, &storage)?;
         let mut cache = self.observations_cache.write().map_err(|e| {
             Error::with_reason(
                 ErrorKind::SamplerError,
                 format!("Failed to acquire observations cache guard: {e}"),
             )
         })?;
-        cache.insert((ctx.study_id, ctx.trial_id), observations);
+        cache.per_trial.insert(
+            (
+                StorageKey(Arc::downgrade(&storage)),
+                ctx.study_id,
+                ctx.trial_id,
+            ),
+            observations,
+        );
         // Trial ids grow monotonically, so the smallest id is the oldest entry.
-        while cache.len() > OBSERVATIONS_CACHE_CAP {
-            let Some(&oldest) = cache.keys().min_by_key(|(_, trial_id)| *trial_id) else {
+        while cache.per_trial.len() > OBSERVATIONS_CACHE_CAP {
+            let Some(oldest) = cache
+                .per_trial
+                .keys()
+                .min_by_key(|(_, _, trial_id)| *trial_id)
+                .cloned()
+            else {
                 break;
             };
-            cache.remove(&oldest);
+            cache.per_trial.remove(&oldest);
         }
         Ok(())
     }
@@ -721,7 +814,7 @@ impl Sampler for TpeSampler {
     fn after_trial(
         &self,
         ctx: &Context,
-        _storage: Arc<RwLock<dyn Storage>>,
+        storage: Arc<RwLock<dyn Storage>>,
         _state_values: &TrialStateValues,
     ) -> Result<()> {
         self.observations_cache
@@ -732,7 +825,12 @@ impl Sampler for TpeSampler {
                     format!("Failed to acquire observations cache guard: {e}"),
                 )
             })?
-            .remove(&(ctx.study_id, ctx.trial_id));
+            .per_trial
+            .remove(&(
+                StorageKey(Arc::downgrade(&storage)),
+                ctx.study_id,
+                ctx.trial_id,
+            ));
         Ok(())
     }
 }
@@ -743,6 +841,7 @@ mod tests {
     use rustuna_core::storage::InMemoryStorage;
     use rustuna_core::study::{create_study, Direction};
     use rustuna_core::study::{get_best_trial, get_pareto_front};
+
     #[test]
     fn test_optimize() {
         let storage = InMemoryStorage::new();
@@ -1291,6 +1390,13 @@ mod tests {
             trial_number: trial_id,
             trial_id,
         };
+        let key = |trial_id| {
+            (
+                StorageKey(Arc::downgrade(&study.storage)),
+                study.id,
+                trial_id,
+            )
+        };
 
         probe
             .before_trial(&ctx(100), study.storage.clone())
@@ -1300,7 +1406,8 @@ mod tests {
                 .observations_cache
                 .read()
                 .unwrap()
-                .get(&(study.id, 100)),
+                .per_trial
+                .get(&key(100)),
             Some(None)
         ));
 
@@ -1315,7 +1422,8 @@ mod tests {
                 .observations_cache
                 .read()
                 .unwrap()
-                .get(&(study.id, 101)),
+                .per_trial
+                .get(&key(101)),
             Some(Some(_))
         ));
 
@@ -1330,7 +1438,8 @@ mod tests {
             .observations_cache
             .read()
             .unwrap()
-            .contains_key(&(study.id, 101)));
+            .per_trial
+            .contains_key(&key(101)));
 
         for trial_id in 200..(200 + OBSERVATIONS_CACHE_CAP as u32 + 5) {
             probe
@@ -1338,10 +1447,12 @@ mod tests {
                 .unwrap();
         }
         let cache = probe.observations_cache.read().unwrap();
-        assert_eq!(cache.len(), OBSERVATIONS_CACHE_CAP);
+        assert_eq!(cache.per_trial.len(), OBSERVATIONS_CACHE_CAP);
         // The oldest entries (smallest trial ids) were evicted first.
-        assert!(!cache.contains_key(&(study.id, 100)));
-        assert!(cache.contains_key(&(study.id, 200 + OBSERVATIONS_CACHE_CAP as u32 + 4)));
+        assert!(!cache.per_trial.contains_key(&key(100)));
+        assert!(cache
+            .per_trial
+            .contains_key(&key(200 + OBSERVATIONS_CACHE_CAP as u32 + 4)));
     }
 
     /// A malformed constraint attr makes the snapshot fail, which surfaces
@@ -1397,5 +1508,185 @@ mod tests {
             result.is_ok(),
             "Optimization should complete without panicking."
         );
+    }
+
+    #[test]
+    fn study_columns_preserve_pending_trials_constraints_and_immutable_snapshots() {
+        let mut storage =
+            InMemoryStorage::new_with_option(rustuna_core::storage::InMemoryStorageOptions {
+                apply_discard: true,
+            });
+        let study_id = storage
+            .create_new_study("history", vec![Direction::Minimize; 2])
+            .unwrap()
+            .id;
+        let earlier = storage.create_new_trial(study_id).unwrap().id;
+        let later = storage.create_new_trial(study_id).unwrap().id;
+        let nan = storage.create_new_trial(study_id).unwrap().id;
+        let failed = storage.create_new_trial(study_id).unwrap().id;
+        let distribution = Distribution::new_float(0.0, 1.0, None, false);
+        for (trial, name, value) in [(earlier, "x", 0.1), (later, "x", 0.2), (later, "y", 0.8)] {
+            storage
+                .set_trial_param(trial, name, &distribution, value)
+                .unwrap();
+        }
+        for (trial, state) in [
+            (later, TrialStateValues::Complete(vec![3.0, 4.0])),
+            (nan, TrialStateValues::Complete(vec![f64::NAN, 1.0])),
+            (failed, TrialStateValues::Fail),
+        ] {
+            storage.set_trial_state_values(trial, state).unwrap();
+        }
+        let mut history = StudyObservations::new(2);
+        history
+            .update(storage.get_trials(study_id).unwrap())
+            .unwrap();
+        let old_snapshot = Arc::clone(&history.observations);
+        assert_eq!(old_snapshot.trial_numbers, [1]);
+        assert_eq!(old_snapshot.values, [3.0, 4.0]);
+        history
+            .update(storage.get_trials(study_id).unwrap())
+            .unwrap();
+        assert!(Arc::ptr_eq(&old_snapshot, &history.observations));
+
+        storage
+            .set_trial_attrs(
+                earlier,
+                rustuna_core::attr::Attrs::from([(
+                    rustuna_core::attr::AttrKey::System("constraints:limit".into()),
+                    "2".into(),
+                )]),
+                false,
+            )
+            .unwrap();
+        storage
+            .set_trial_state_values(earlier, TrialStateValues::Complete(vec![1.0, 2.0]))
+            .unwrap();
+        history
+            .update(storage.get_trials(study_id).unwrap())
+            .unwrap();
+        assert_eq!(history.observations.trial_numbers, [0, 1]);
+        assert_eq!(history.observations.values, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            history.observations.param_columns["x"],
+            [Some(0.1), Some(0.2)]
+        );
+        assert_eq!(history.observations.param_columns["y"], [None, Some(0.8)]);
+        assert_eq!(
+            history.observations.feasibles_violations,
+            [(false, 2.0), (true, 0.0)]
+        );
+        assert_eq!(old_snapshot.values, [3.0, 4.0]);
+        assert!(!Arc::ptr_eq(&old_snapshot, &history.observations));
+        assert!(storage
+            .set_trial_param(earlier, "x", &distribution, 0.9)
+            .is_err());
+        assert!(storage
+            .set_trial_state_values(earlier, TrialStateValues::Complete(vec![9.0, 9.0]))
+            .is_err());
+        assert!(storage
+            .set_trial_attrs(earlier, rustuna_core::attr::Attrs::new(), false)
+            .is_err());
+
+        let before_discard = Arc::clone(&history.observations);
+        storage.discard_trials(&[later]).unwrap();
+        history
+            .update(storage.get_trials(study_id).unwrap())
+            .unwrap();
+        assert_eq!(history.observations.trial_numbers, [0]);
+        assert_eq!(history.observations.values, [1.0, 2.0]);
+        assert!(!history.observations.param_columns.contains_key("y"));
+        assert_eq!(before_discard.values, [1.0, 2.0, 3.0, 4.0]);
+
+        let mut fresh = StudyObservations::new(2);
+        fresh.update(storage.get_trials(study_id).unwrap()).unwrap();
+        assert_eq!(
+            history.observations.param_columns,
+            fresh.observations.param_columns
+        );
+        assert_eq!(history.observations.values, fresh.observations.values);
+    }
+
+    #[test]
+    fn observation_caches_distinguish_storages_with_identical_study_and_trial_ids() {
+        let make_storage = |value| -> Arc<RwLock<dyn Storage>> {
+            let mut storage = InMemoryStorage::new();
+            let study_id = storage
+                .create_new_study("independent", vec![Direction::Minimize])
+                .unwrap()
+                .id;
+            let trial_id = storage.create_new_trial(study_id).unwrap().id;
+            storage
+                .set_trial_param(
+                    trial_id,
+                    "x",
+                    &Distribution::new_float(0.0, 10.0, None, false),
+                    value,
+                )
+                .unwrap();
+            storage
+                .set_trial_state_values(trial_id, TrialStateValues::Complete(vec![value]))
+                .unwrap();
+            Arc::new(RwLock::new(storage))
+        };
+        let first = make_storage(1.0);
+        let second = make_storage(9.0);
+        let sampler = TpeBuilder::new().n_startup_trials(1).seed(0).build();
+        let ctx = Context {
+            study_id: 0,
+            trial_id: 100,
+            trial_number: 1,
+            directions: vec![Direction::Minimize],
+        };
+        sampler.before_trial(&ctx, first.clone()).unwrap();
+        sampler.before_trial(&ctx, second.clone()).unwrap();
+        let values = |storage: &Arc<RwLock<dyn Storage>>| {
+            sampler
+                .observations_for_trial(&ctx, storage)
+                .unwrap()
+                .unwrap()
+                .values
+                .clone()
+        };
+        assert_eq!(values(&first), [1.0]);
+        assert_eq!(values(&second), [9.0]);
+        sampler
+            .after_trial(&ctx, first.clone(), &TrialStateValues::Fail)
+            .unwrap();
+        assert_eq!(values(&second), [9.0]);
+        drop(first);
+        sampler.before_trial(&ctx, second).unwrap();
+        assert_eq!(sampler.observations_cache.read().unwrap().studies.len(), 1);
+    }
+
+    #[test]
+    fn retained_study_histories_have_a_bounded_capacity() {
+        let storage: Arc<RwLock<dyn Storage>> = Arc::new(RwLock::new(InMemoryStorage::new()));
+        let sampler = TpeBuilder::new().n_startup_trials(1).build();
+        for index in 0..OBSERVATIONS_CACHE_CAP + 5 {
+            let study_id = storage
+                .write()
+                .unwrap()
+                .create_new_study(&format!("bounded-{index}"), vec![Direction::Minimize])
+                .unwrap()
+                .id;
+            let ctx = Context {
+                study_id,
+                trial_id: study_id,
+                trial_number: 0,
+                directions: vec![Direction::Minimize],
+            };
+            sampler.before_trial(&ctx, storage.clone()).unwrap();
+        }
+        let cache = sampler.observations_cache.read().unwrap();
+        assert_eq!(cache.studies.len(), OBSERVATIONS_CACHE_CAP);
+        assert_eq!(cache.per_trial.len(), OBSERVATIONS_CACHE_CAP);
+        assert!(!cache
+            .studies
+            .contains_key(&(StorageKey(Arc::downgrade(&storage)), 0)));
+        assert!(cache.studies.contains_key(&(
+            StorageKey(Arc::downgrade(&storage)),
+            (OBSERVATIONS_CACHE_CAP + 4) as u32
+        )));
     }
 }
