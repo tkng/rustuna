@@ -693,8 +693,9 @@ impl TpeSampler {
             .collect();
         let mut active_counts: Vec<u32> = vec![0; n_trials];
 
-        for (trial_idx, &row) in order.iter().enumerate() {
-            for (param_idx, column) in observations_vec.iter_mut().enumerate() {
+        // Keep each input and output column local while preserving row order.
+        for (param_idx, column) in observations_vec.iter_mut().enumerate() {
+            for (trial_idx, &row) in order.iter().enumerate() {
                 if let Some(v) = observations.param_at(row, param_idx) {
                     column.push(v);
                     active_counts[trial_idx] += 1;
