@@ -363,11 +363,18 @@ impl MixtureOfProductDistribution {
     }
 
     pub fn sample(&self, rng: &mut StdRng, size: usize) -> Vec<HashMap<String, f64>> {
-        let mut samples: Vec<HashMap<String, f64>> = Vec::with_capacity(size);
+        self.sample_ordered(rng, size)
+            .into_iter()
+            .map(|values| self.param_names.iter().cloned().zip(values).collect())
+            .collect()
+    }
+
+    pub fn sample_ordered(&self, rng: &mut StdRng, size: usize) -> Vec<Vec<f64>> {
+        let mut samples: Vec<Vec<f64>> = Vec::with_capacity(size);
 
         for _ in 0..size {
             let k = self.alias.sample(rng); // Active kernel index
-            let mut sample = HashMap::with_capacity(self.param_names.len());
+            let mut sample = Vec::with_capacity(self.param_names.len());
             for (param, dist) in self.param_names.iter().zip(self.distributions.iter()) {
                 match dist {
                     Distributions::TruncNorm(d) => {
@@ -381,7 +388,7 @@ impl MixtureOfProductDistribution {
                             sigma,
                         )
                         .unwrap();
-                        sample.insert(param.clone(), value);
+                        sample.push(value);
                     }
                     Distributions::TruncLogNorm(d) => {
                         let mu = d.mus[k];
@@ -394,7 +401,7 @@ impl MixtureOfProductDistribution {
                             sigma,
                         )
                         .unwrap();
-                        sample.insert(param.clone(), log_value.exp());
+                        sample.push(log_value.exp());
                     }
                     Distributions::DiscreteTruncNorm(d) => {
                         let mu = d.mus[k];
@@ -410,7 +417,7 @@ impl MixtureOfProductDistribution {
                         let discrete_value = (d.low + ((value - d.low) / d.step).round() * d.step)
                             .max(d.low)
                             .min(d.high);
-                        sample.insert(param.clone(), discrete_value);
+                        sample.push(discrete_value);
                     }
                     Distributions::DiscreteTruncLogNorm(d) => {
                         let mu = d.mus[k];
@@ -428,7 +435,7 @@ impl MixtureOfProductDistribution {
                             + ((original - d.low) / d.step).round() * d.step)
                             .max(d.low)
                             .min(d.high);
-                        sample.insert(param.clone(), discrete_value);
+                        sample.push(discrete_value);
                     }
                     Distributions::Categorical(d) => {
                         let sum: f64 = (0..d.cardinality)
@@ -449,7 +456,7 @@ impl MixtureOfProductDistribution {
                                 break;
                             }
                         }
-                        sample.insert(param.clone(), chosen);
+                        sample.push(chosen);
                     }
                 }
             }
@@ -460,15 +467,23 @@ impl MixtureOfProductDistribution {
     }
 
     pub fn log_pdf(&self, x: &HashMap<String, f64>) -> f64 {
+        self.log_pdf_values(self.param_names.iter().map(|name| x.get(name).copied()))
+    }
+
+    pub fn log_pdf_ordered(&self, values: &[f64]) -> f64 {
+        if values.len() != self.distributions.len() {
+            return f64::NEG_INFINITY;
+        }
+        self.log_pdf_values(values.iter().copied().map(Some))
+    }
+
+    fn log_pdf_values(&self, values: impl Iterator<Item = Option<f64>>) -> f64 {
         let n = self.n_kernels;
         let mut weighted_log_pdf = vec![0.0_f64; n];
 
-        for (param, dist) in self.param_names.iter().zip(self.distributions.iter()) {
-            let x_val = match x.get(param) {
-                Some(v) => *v,
-                None => {
-                    return f64::NEG_INFINITY;
-                }
+        for (dist, value) in self.distributions.iter().zip(values) {
+            let Some(x_val) = value else {
+                return f64::NEG_INFINITY;
             };
 
             match dist {

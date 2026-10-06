@@ -460,26 +460,32 @@ impl TpeSampler {
             )
         };
 
+        assert_eq!(pe_good.parameter_names(), pe_poor.parameter_names());
         let n_ei_candidates = 24;
-        let samples_good = {
+        let mut samples_good = {
             let mut rng = self.rng.lock().map_err(|e| {
                 Error::with_reason(
                     ErrorKind::SamplerError,
                     format!("Failed to acquire RNG guard: {e}"),
                 )
             })?;
-            pe_good.sample(&mut rng, n_ei_candidates)
+            pe_good.sample_ordered(&mut rng, n_ei_candidates)
         };
         let mut best_idx = 0usize;
         let mut best_val = f64::NEG_INFINITY;
         for (i, s) in samples_good.iter().enumerate() {
-            let acquisition = pe_good.log_pdf(s) - pe_poor.log_pdf(s);
+            let acquisition = pe_good.log_pdf_ordered(s) - pe_poor.log_pdf_ordered(s);
             if acquisition > best_val {
                 best_val = acquisition;
                 best_idx = i;
             }
         }
-        Ok(samples_good[best_idx].clone())
+        Ok(pe_good
+            .parameter_names()
+            .iter()
+            .cloned()
+            .zip(samples_good.swap_remove(best_idx))
+            .collect())
     }
 
     fn split_rows_for_single_objective(

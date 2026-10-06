@@ -111,8 +111,24 @@ impl ParzenEstimator {
         self.mixuture_distribution.sample(rng, size)
     }
 
+    /// Returns the parameter names used by ordered samples and scores.
+    pub fn parameter_names(&self) -> &[String] {
+        &self.mixuture_distribution.param_names
+    }
+
+    /// Samples values in [`Self::parameter_names`] order.
+    pub fn sample_ordered(&self, rng: &mut StdRng, size: usize) -> Vec<Vec<f64>> {
+        self.mixuture_distribution.sample_ordered(rng, size)
+    }
+
     pub fn log_pdf(&self, x: &HashMap<String, f64>) -> f64 {
         self.mixuture_distribution.log_pdf(x)
+    }
+
+    /// Scores values in [`Self::parameter_names`] order.
+    /// Returns negative infinity if the value count does not match the model.
+    pub fn log_pdf_ordered(&self, values: &[f64]) -> f64 {
+        self.mixuture_distribution.log_pdf_ordered(values)
     }
 }
 
@@ -353,6 +369,37 @@ mod tests {
             ParzenEstimator::new(&observations, &search_space, &[0.2, 0.5, 0.3], 1.0);
         let mut rng = StdRng::seed_from_u64(42);
         let samples = parzen_estimator.sample(&mut rng, 10);
+        let mut ordered_rng = StdRng::seed_from_u64(42);
+        let ordered = parzen_estimator.sample_ordered(&mut ordered_rng, 10);
+        assert_eq!(
+            parzen_estimator.parameter_names(),
+            ["a", "b", "c", "d", "e"]
+        );
+        for (sample, values) in samples.iter().zip(&ordered) {
+            assert_eq!(
+                *values,
+                ["a", "b", "c", "d", "e"].map(|name| sample[name]).to_vec()
+            );
+            assert_eq!(
+                parzen_estimator.log_pdf(sample).to_bits(),
+                parzen_estimator.log_pdf_ordered(values).to_bits()
+            );
+        }
+        assert_eq!(
+            rand::RngCore::next_u64(&mut rng),
+            rand::RngCore::next_u64(&mut ordered_rng)
+        );
+        assert_eq!(parzen_estimator.log_pdf_ordered(&[]), f64::NEG_INFINITY);
+        assert_eq!(
+            parzen_estimator.log_pdf_ordered(&[0.0; 6]),
+            f64::NEG_INFINITY
+        );
+        let mut invalid = ordered[0].clone();
+        invalid[0] = -1.0;
+        assert_eq!(
+            parzen_estimator.log_pdf_ordered(&invalid),
+            f64::NEG_INFINITY
+        );
         assert_eq!(samples.len(), 10);
         for sample in samples.iter() {
             let a = sample.get("a").unwrap();
