@@ -284,34 +284,7 @@ impl CategoricalDistributionBuilder for DefaultCategoricalDistributionBuilder {
             _ => unreachable!("Invalid distribution type for categorical calculation"),
         };
 
-        if observations.is_empty() {
-            // Case: prior only
-            let weights_row = vec![1.0 / cardinality as f64; cardinality];
-            return Distributions::Categorical(CategoricalDistributions {
-                weights: vec![weights_row],
-            });
-        }
-
-        let n_kernels = observations.len() + 1; // +1 for prior
-        let prior_mass_per_kernel = 1.0 / (n_kernels as f64);
-        let mut weights = vec![vec![prior_mass_per_kernel; cardinality]; n_kernels];
-        for (i, &v) in observations.iter().enumerate() {
-            let col = v as usize;
-            assert!(
-                col < cardinality,
-                "Observed index {col} out of range (cardinality = {cardinality})",
-            );
-            weights[i][col] += 1.0;
-        }
-        for row in weights.iter_mut() {
-            let s = row.iter().sum::<f64>();
-            let denom = if s == 0.0 { 1.0 } else { s };
-            for x in row.iter_mut() {
-                *x /= denom;
-            }
-        }
-
-        Distributions::Categorical(CategoricalDistributions { weights })
+        Distributions::Categorical(CategoricalDistributions::new(observations, cardinality))
     }
 }
 
