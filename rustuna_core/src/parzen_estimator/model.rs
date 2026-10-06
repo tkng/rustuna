@@ -1,5 +1,5 @@
 use rand::rngs::StdRng;
-use std::{collections::HashMap, vec};
+use std::{borrow::Cow, collections::HashMap, vec};
 
 use super::probability_distributions::CategoricalDistributions;
 use super::probability_distributions::{
@@ -11,6 +11,42 @@ use crate::parzen_estimator::scott::ScottNumericalDistributionBuilder;
 
 pub struct ParzenEstimator {
     mixuture_distribution: MixtureOfProductDistribution,
+}
+
+enum ObservationValues<'a, I> {
+    Borrowed(&'a [f64]),
+    Selected(I),
+}
+
+impl<'a, I: Iterator<Item = f64>> ObservationValues<'a, I> {
+    fn into_slice(self) -> Cow<'a, [f64]> {
+        match self {
+            Self::Borrowed(values) => Cow::Borrowed(values),
+            Self::Selected(values) => Cow::Owned(values.collect()),
+        }
+    }
+}
+
+impl<I: Iterator<Item = f64>> Iterator for ObservationValues<'_, I> {
+    type Item = f64;
+
+    fn next(&mut self) -> Option<f64> {
+        match self {
+            Self::Borrowed(values) => {
+                let (value, rest) = values.split_first()?;
+                *values = rest;
+                Some(*value)
+            }
+            Self::Selected(values) => values.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Borrowed(values) => (values.len(), Some(values.len())),
+            Self::Selected(values) => values.size_hint(),
+        }
+    }
 }
 
 impl ParzenEstimator {
@@ -70,18 +106,89 @@ impl ParzenEstimator {
         let mut keys: Vec<_> = search_space.keys().collect();
         keys.sort();
 
-        let mut distributions = HashMap::with_capacity(keys.len());
-        for key in keys.iter() {
-            let obs_vec = observations.get(*key).map(Vec::as_slice).unwrap_or(&[]);
-            let dist = match &search_space[*key] {
+        Self::with_ordered_builder(
+            keys.into_iter().map(|key| {
+                (
+                    key.as_str(),
+                    &search_space[key],
+                    ObservationValues::<std::iter::Empty<f64>>::Borrowed(
+                        observations.get(key).map(Vec::as_slice).unwrap_or(&[]),
+                    ),
+                )
+            }),
+            weights,
+            prior_weight,
+            num_builder,
+            cat_builder,
+        )
+    }
+
+    /// Builds a model from columns in strictly increasing parameter-name order.
+    /// Each column must provide one value for each observation weight.
+    pub fn from_ordered_observations<'a, I, V>(
+        parameters: I,
+        weights: &[f64],
+        prior_weight: f64,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a Distribution, V)>,
+        V: IntoIterator<Item = f64>,
+    {
+        let model = Self::with_ordered_builder(
+            parameters.into_iter().map(|(name, distribution, values)| {
+                (
+                    name,
+                    distribution,
+                    ObservationValues::Selected(values.into_iter()),
+                )
+            }),
+            weights,
+            prior_weight,
+            &DefaultNumericalDistributionBuilder,
+            &DefaultCategoricalDistributionBuilder,
+        );
+        assert!(
+            model
+                .mixuture_distribution
+                .distributions
+                .iter()
+                .all(|distribution| distribution.n_kernels() == weights.len() + 1),
+            "Observation columns and weights differ in length"
+        );
+        model
+    }
+
+    fn with_ordered_builder<'a, I, V>(
+        parameters: I,
+        weights: &[f64],
+        prior_weight: f64,
+        num_builder: &impl NumericalDistributionBuilder,
+        cat_builder: &impl CategoricalDistributionBuilder,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a Distribution, ObservationValues<'a, V>)>,
+        V: Iterator<Item = f64>,
+    {
+        let parameters = parameters.into_iter();
+        let mut distributions: Vec<(String, Distributions)> =
+            Vec::with_capacity(parameters.size_hint().0);
+        for (name, search_space, values) in parameters {
+            if let Some((previous, _)) = distributions.last() {
+                assert!(
+                    previous.as_str() < name,
+                    "Parameter names must be sorted and unique"
+                );
+            }
+            let distribution = match search_space {
                 Distribution::Float { .. } | Distribution::Int { .. } => {
-                    num_builder.calculate_numerical_distribution(obs_vec, &search_space[*key])
+                    let values = values.into_slice();
+                    num_builder.calculate_numerical_distribution(&values, search_space)
                 }
                 Distribution::Categorical { .. } => {
-                    cat_builder.calculate_categorical_distribution(obs_vec, &search_space[*key])
+                    cat_builder.calculate_categorical_distribution(values.into_iter(), search_space)
                 }
             };
-            distributions.insert((*key).clone(), dist);
+            distributions.push((name.to_owned(), distribution));
         }
 
         let weights_sum = {
@@ -143,7 +250,7 @@ pub(crate) trait NumericalDistributionBuilder {
 pub(crate) trait CategoricalDistributionBuilder {
     fn calculate_categorical_distribution(
         &self,
-        observations: &[f64],
+        observations: impl Iterator<Item = f64>,
         search_space: &Distribution,
     ) -> Distributions;
 }
@@ -292,7 +399,7 @@ impl NumericalDistributionBuilder for DefaultNumericalDistributionBuilder {
 impl CategoricalDistributionBuilder for DefaultCategoricalDistributionBuilder {
     fn calculate_categorical_distribution(
         &self,
-        observations: &[f64],
+        observations: impl Iterator<Item = f64>,
         search_space: &Distribution,
     ) -> Distributions {
         let cardinality = match search_space {
@@ -367,10 +474,23 @@ mod tests {
 
         let parzen_estimator =
             ParzenEstimator::new(&observations, &search_space, &[0.2, 0.5, 0.3], 1.0);
+        let streamed = ParzenEstimator::from_ordered_observations(
+            ["a", "b", "c", "d", "e"].map(|name| {
+                (
+                    name,
+                    &search_space[name],
+                    observations[name].iter().copied(),
+                )
+            }),
+            &[0.2, 0.5, 0.3],
+            1.0,
+        );
         let mut rng = StdRng::seed_from_u64(42);
         let samples = parzen_estimator.sample(&mut rng, 10);
         let mut ordered_rng = StdRng::seed_from_u64(42);
         let ordered = parzen_estimator.sample_ordered(&mut ordered_rng, 10);
+        let mut streamed_rng = StdRng::seed_from_u64(42);
+        assert_eq!(ordered, streamed.sample_ordered(&mut streamed_rng, 10));
         assert_eq!(
             parzen_estimator.parameter_names(),
             ["a", "b", "c", "d", "e"]
@@ -383,6 +503,10 @@ mod tests {
             assert_eq!(
                 parzen_estimator.log_pdf(sample).to_bits(),
                 parzen_estimator.log_pdf_ordered(values).to_bits()
+            );
+            assert_eq!(
+                parzen_estimator.log_pdf_ordered(values).to_bits(),
+                streamed.log_pdf_ordered(values).to_bits()
             );
         }
         assert_eq!(
@@ -413,5 +537,42 @@ mod tests {
             let e = sample.get("e").unwrap();
             assert!(*e == 0.0 || *e == 1.0 || *e == 2.0);
         }
+    }
+
+    #[test]
+    fn ordered_observations_keep_the_uniform_categorical_prior() {
+        let distribution = Distribution::new_categorical(3);
+        let model = ParzenEstimator::from_ordered_observations(
+            [("x", &distribution, std::iter::empty())],
+            &[],
+            1.0,
+        );
+        for category in 0..3 {
+            assert_eq!(
+                model.log_pdf_ordered(&[category as f64]),
+                (1.0_f64 / 3.0).ln()
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Observation columns and weights differ in length")]
+    fn ordered_observations_reject_inconsistent_weights() {
+        ParzenEstimator::from_ordered_observations(
+            [("x", &Distribution::new_categorical(3), [1.0, 2.0])],
+            &[1.0],
+            1.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Parameter names must be sorted and unique")]
+    fn ordered_observations_reject_unsorted_parameters() {
+        let distribution = Distribution::new_categorical(3);
+        ParzenEstimator::from_ordered_observations(
+            [("b", &distribution, [0.0]), ("a", &distribution, [1.0])],
+            &[1.0],
+            1.0,
+        );
     }
 }

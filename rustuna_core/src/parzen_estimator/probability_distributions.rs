@@ -267,17 +267,17 @@ pub(crate) struct CategoricalDistributions {
 }
 
 impl CategoricalDistributions {
-    pub(crate) fn new(observations: &[f64], cardinality: usize) -> Self {
+    pub(crate) fn new(observations: impl IntoIterator<Item = f64>, cardinality: usize) -> Self {
         assert!(cardinality > 0, "Categorical cardinality must be positive");
-        let observed_categories = observations
-            .iter()
-            .map(|&value| {
-                let category = value as usize;
-                assert!(category < cardinality, "Observed category is out of range");
-                category
-            })
-            .collect();
-        let prior_mass = 1.0 / (observations.len() + 1) as f64;
+        let observations = observations.into_iter();
+        let (lower, upper) = observations.size_hint();
+        let mut observed_categories = Vec::with_capacity(upper.unwrap_or(lower));
+        for value in observations {
+            let category = value as usize;
+            assert!(category < cardinality, "Observed category is out of range");
+            observed_categories.push(category);
+        }
+        let prior_mass = 1.0 / (observed_categories.len() + 1) as f64;
         let denominator = 1.0 + cardinality as f64 * prior_mass;
         let matching = (1.0 + prior_mass) / denominator;
         let other = prior_mass / denominator;
@@ -321,6 +321,18 @@ pub(crate) enum Distributions {
     Categorical(CategoricalDistributions),
 }
 
+impl Distributions {
+    pub(crate) fn n_kernels(&self) -> usize {
+        match self {
+            Self::TruncNorm(d) => d.mus.len(),
+            Self::TruncLogNorm(d) => d.mus.len(),
+            Self::DiscreteTruncNorm(d) => d.mus.len(),
+            Self::DiscreteTruncLogNorm(d) => d.mus.len(),
+            Self::Categorical(d) => d.observed_categories.len() + 1,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MixtureOfProductDistribution {
     pub param_names: Vec<String>,          // Sorted param names
@@ -332,7 +344,7 @@ pub(crate) struct MixtureOfProductDistribution {
 }
 
 impl MixtureOfProductDistribution {
-    pub fn new(distributions_map: HashMap<String, Distributions>, weights: Vec<f64>) -> Self {
+    pub fn new(entries: Vec<(String, Distributions)>, weights: Vec<f64>) -> Self {
         let sum_w = weights.iter().sum::<f64>();
         let log_sum_weights = if sum_w > 0.0 {
             sum_w.ln()
@@ -348,8 +360,6 @@ impl MixtureOfProductDistribution {
         let alias =
             WeightedAliasIndex::new(weights).expect("weights must be non-empty and non-negative");
 
-        let mut entries: Vec<_> = distributions_map.into_iter().collect();
-        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let (param_names, distributions) = entries.into_iter().unzip();
 
         MixtureOfProductDistribution {
@@ -597,8 +607,8 @@ mod tests {
             5.0,
             1.0,
         );
-        let categorical_dist = CategoricalDistributions::new(&[0.0], 2);
-        let distributions = vec![
+        let categorical_dist = CategoricalDistributions::new([0.0], 2);
+        let mut distributions = vec![
             (
                 "param_truncnorm".to_string(),
                 Distributions::TruncNorm(truncnorm_dist),
@@ -620,10 +630,9 @@ mod tests {
                 Distributions::Categorical(categorical_dist),
             ),
         ];
-        let distributions_map: std::collections::HashMap<String, Distributions> =
-            distributions.into_iter().collect();
+        distributions.sort_by(|a, b| a.0.cmp(&b.0));
         let mixture = MixtureOfProductDistribution::new(
-            distributions_map,
+            distributions,
             vec![0.5, 0.5], // weights.len() == mus.len()
         );
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
@@ -644,7 +653,7 @@ mod tests {
 
     #[test]
     fn categorical_kernels_keep_smoothed_probabilities_and_uniform_prior() {
-        let distribution = CategoricalDistributions::new(&[1.0, 2.0], 3);
+        let distribution = CategoricalDistributions::new([1.0, 2.0], 3);
         let expected = [
             [1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0],
             [1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0],
@@ -659,8 +668,8 @@ mod tests {
             }
         }
         for cardinality in [1, 3, 257] {
-            let prior = CategoricalDistributions::new(&[], cardinality);
-            let singleton = CategoricalDistributions::new(&[0.0; 10], 1);
+            let prior = CategoricalDistributions::new([], cardinality);
+            let singleton = CategoricalDistributions::new([0.0; 10], 1);
             let mut scores = vec![0.0; 1];
             prior.accumulate_log_pdf(0, &mut scores);
             assert_eq!(prior.probability(0, 0), 1.0 / cardinality as f64);
@@ -672,16 +681,16 @@ mod tests {
     #[test]
     fn categorical_joint_density_keeps_observation_correlations_and_weights() {
         let mixture = MixtureOfProductDistribution::new(
-            HashMap::from([
+            vec![
                 (
                     "x".into(),
-                    Distributions::Categorical(CategoricalDistributions::new(&[0.0, 1.0], 2)),
+                    Distributions::Categorical(CategoricalDistributions::new([0.0, 1.0], 2)),
                 ),
                 (
                     "y".into(),
-                    Distributions::Categorical(CategoricalDistributions::new(&[0.0, 1.0], 2)),
+                    Distributions::Categorical(CategoricalDistributions::new([0.0, 1.0], 2)),
                 ),
-            ]),
+            ],
             vec![1.0, 2.0, 0.5],
         );
         let matching = 4.0_f64 / 5.0;

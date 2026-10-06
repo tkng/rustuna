@@ -200,8 +200,20 @@ struct TpeObservationsView<'a> {
     trial_numbers: &'a [u32],
     values: &'a [f64],
     n_objectives: usize,
-    param_columns: Vec<Option<&'a [Option<f64>]>>,
+    param_columns: Vec<TpeObservationColumn<'a>>,
     feasibles_violations: &'a [(bool, f64)],
+}
+
+struct TpeObservationColumn<'a> {
+    name: &'a str,
+    distribution: &'a Distribution,
+    values: Option<&'a [Option<f64>]>,
+}
+
+impl TpeObservationColumn<'_> {
+    fn at(&self, row: usize) -> Option<f64> {
+        self.values.and_then(|values| values[row])
+    }
 }
 
 impl TpeObservationSet {
@@ -263,7 +275,10 @@ impl TpeObservationSet {
         }
     }
 
-    fn view(&self, search_space: &HashMap<String, Distribution>) -> TpeObservationsView<'_> {
+    fn view<'a>(
+        &'a self,
+        search_space: &'a HashMap<String, Distribution>,
+    ) -> TpeObservationsView<'a> {
         let mut sorted_keys: Vec<&String> = search_space.keys().collect();
         sorted_keys.sort();
         TpeObservationsView {
@@ -271,8 +286,12 @@ impl TpeObservationSet {
             values: &self.values,
             n_objectives: self.n_objectives,
             param_columns: sorted_keys
-                .iter()
-                .map(|name| self.param_columns.get(*name).map(Vec::as_slice))
+                .into_iter()
+                .map(|name| TpeObservationColumn {
+                    name,
+                    distribution: &search_space[name],
+                    values: self.param_columns.get(name).map(Vec::as_slice),
+                })
                 .collect(),
             feasibles_violations: &self.feasibles_violations,
         }
@@ -286,10 +305,6 @@ impl TpeObservationsView<'_> {
 
     fn values_row(&self, row: usize) -> &[f64] {
         &self.values[row * self.n_objectives..(row + 1) * self.n_objectives]
-    }
-
-    fn param_at(&self, row: usize, param_idx: usize) -> Option<f64> {
-        self.param_columns[param_idx].and_then(|col| col[row])
     }
 }
 
@@ -384,7 +399,6 @@ impl TpeSampler {
         &self,
         ctx: &Context,
         observations: &TpeObservationsView<'_>,
-        search_space: &HashMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         let n = observations.len();
         let is_multi_objective = ctx.directions.len() > 1;
@@ -396,8 +410,8 @@ impl TpeSampler {
                 Self::split_rows_for_single_objective(observations, direction, gamma);
             // Single-objective: recency ramp for both l(x) and g(x) (Optuna default_weights).
             (
-                Self::build_parzen_estimator(observations, &good_rows, search_space, true),
-                Self::build_parzen_estimator(observations, &poor_rows, search_space, true),
+                Self::build_parzen_estimator(observations, &good_rows, true),
+                Self::build_parzen_estimator(observations, &poor_rows, true),
             )
         } else {
             let directions: &[Direction] = &ctx.directions;
@@ -455,8 +469,8 @@ impl TpeSampler {
             // Multi-objective: uniform weights for l(x) (below), recency ramp for g(x) (above),
             // matching Optuna's multi-objective TPE.
             (
-                Self::build_parzen_estimator(observations, &good_rows, search_space, false),
-                Self::build_parzen_estimator(observations, &poor_rows, search_space, true),
+                Self::build_parzen_estimator(observations, &good_rows, false),
+                Self::build_parzen_estimator(observations, &poor_rows, true),
             )
         };
 
@@ -677,15 +691,10 @@ impl TpeSampler {
     fn build_parzen_estimator(
         observations: &TpeObservationsView<'_>,
         rows: &[usize],
-        search_space: &HashMap<String, Distribution>,
         recency_ramp: bool,
     ) -> ParzenEstimator {
-        let mut sorted_keys: Vec<&String> = search_space.keys().collect();
-        sorted_keys.sort();
-
-        let n_params = sorted_keys.len();
+        let n_params = observations.param_columns.len();
         let n_trials = rows.len();
-        debug_assert_eq!(n_params, observations.param_columns.len());
 
         // Process trials in chronological (trial-number ascending) order so that the
         // recency ramp assigns the highest weights to the most recent trials, matching
@@ -694,16 +703,11 @@ impl TpeSampler {
         let mut order: Vec<usize> = rows.to_vec();
         order.sort_by_key(|&row| observations.trial_numbers[row]);
 
-        let mut observations_vec: Vec<Vec<f64>> = (0..n_params)
-            .map(|_| Vec::with_capacity(n_trials))
-            .collect();
         let mut active_counts: Vec<u32> = vec![0; n_trials];
 
-        // Keep each input and output column local while preserving row order.
-        for (param_idx, column) in observations_vec.iter_mut().enumerate() {
+        for column in &observations.param_columns {
             for (trial_idx, &row) in order.iter().enumerate() {
-                if let Some(v) = observations.param_at(row, param_idx) {
-                    column.push(v);
+                if column.at(row).is_some() {
                     active_counts[trial_idx] += 1;
                 }
             }
@@ -722,12 +726,17 @@ impl TpeSampler {
         };
         let active_weights: Vec<f64> = active_indices.iter().map(|&i| weights[i]).collect();
         let prior_weight = 1.0;
-        let observations: HashMap<String, Vec<f64>> = sorted_keys
-            .iter()
-            .zip(observations_vec)
-            .map(|(k, v)| ((*k).clone(), v))
-            .collect();
-        ParzenEstimator::new(&observations, search_space, &active_weights, prior_weight)
+        ParzenEstimator::from_ordered_observations(
+            observations.param_columns.iter().map(|column| {
+                (
+                    column.name,
+                    column.distribution,
+                    order.iter().filter_map(|&row| column.at(row)),
+                )
+            }),
+            &active_weights,
+            prior_weight,
+        )
     }
 }
 
@@ -780,7 +789,7 @@ impl Sampler for TpeSampler {
                 .random_sampler
                 .sample_independent(ctx, storage, name, distribution);
         };
-        let params = self.sample(ctx, &observations.view(&search_space), &search_space)?;
+        let params = self.sample(ctx, &observations.view(&search_space))?;
         Ok(params[name])
     }
 
@@ -815,7 +824,7 @@ impl Sampler for TpeSampler {
         let Some(observations) = self.observations_for_trial(ctx, &storage)? else {
             return Ok(HashMap::new());
         };
-        self.sample(ctx, &observations.view(search_space), search_space)
+        self.sample(ctx, &observations.view(search_space))
     }
 
     fn after_trial(
