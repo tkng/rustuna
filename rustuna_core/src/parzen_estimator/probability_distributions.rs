@@ -6,6 +6,70 @@ use std::collections::HashMap;
 
 use super::truncnorm::NEG_HALF_LOG_2PI;
 
+/// Numerical kernel parameters, independent of cached density coefficients.
+#[derive(Default)]
+pub(crate) struct NumericalParameters {
+    pub mus: Vec<f64>,
+    pub sigmas: Vec<f64>,
+    pub low: f64,
+    pub high: f64,
+    pub step: Option<f64>,
+    pub log: bool,
+}
+
+/// Previous continuous-normal kernels, retained until the new coefficients are computed.
+#[derive(Default)]
+struct NormalBuffers {
+    mus: Vec<f64>,
+    sigmas: Vec<f64>,
+    log_consts: Vec<f64>,
+}
+
+fn normal_log_constants(
+    parameters: &NumericalParameters,
+    previous: &NormalBuffers,
+    indices: &[Option<usize>],
+    constants: &mut Vec<f64>,
+) {
+    let (low, high) = if parameters.log {
+        (parameters.low.ln(), parameters.high.ln())
+    } else {
+        (parameters.low, parameters.high)
+    };
+    constants.clear();
+    constants.extend(
+        parameters
+            .mus
+            .iter()
+            .zip(&parameters.sigmas)
+            .enumerate()
+            .map(|(k, (&mu, &sigma))| {
+                let old_index = if k + 1 == parameters.mus.len() {
+                    previous.mus.len().checked_sub(1) // Prior kernel.
+                } else {
+                    indices.get(k).copied().flatten()
+                };
+                if let Some(i) = old_index {
+                    if previous.mus.get(i).map(|m| m.to_bits()) == Some(mu.to_bits())
+                        && previous.sigmas.get(i).map(|s| s.to_bits()) == Some(sigma.to_bits())
+                    {
+                        if let Some(&constant) = previous.log_consts.get(i).filter(|c| !c.is_nan())
+                        {
+                            return constant;
+                        }
+                    }
+                }
+                let ln_mass = truncnorm::log_diff_cdf((low - mu) / sigma, (high - mu) / sigma)
+                    .unwrap_or(f64::NEG_INFINITY);
+                if ln_mass == f64::NEG_INFINITY {
+                    f64::NEG_INFINITY
+                } else {
+                    NEG_HALF_LOG_2PI - sigma.ln() - ln_mass
+                }
+            }),
+    );
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TruncNormDistributions {
     pub mus: Vec<f64>,
@@ -18,29 +82,6 @@ pub(crate) struct TruncNormDistributions {
 }
 
 impl TruncNormDistributions {
-    pub(crate) fn new(mus: Vec<f64>, sigmas: Vec<f64>, low: f64, high: f64) -> Self {
-        let log_consts = mus
-            .iter()
-            .zip(sigmas.iter())
-            .map(|(&mu, &sigma)| {
-                let ln_mass = truncnorm::log_diff_cdf((low - mu) / sigma, (high - mu) / sigma)
-                    .unwrap_or(f64::NEG_INFINITY);
-                if ln_mass == f64::NEG_INFINITY {
-                    f64::NEG_INFINITY
-                } else {
-                    NEG_HALF_LOG_2PI - sigma.ln() - ln_mass
-                }
-            })
-            .collect();
-        Self {
-            mus,
-            sigmas,
-            low,
-            high,
-            log_consts,
-        }
-    }
-
     /// Adds each kernel's log PDF at x into `acc`.
     pub(crate) fn accumulate_log_pdf(&self, x: f64, acc: &mut [f64]) {
         for (k, a) in acc.iter_mut().enumerate() {
@@ -62,32 +103,6 @@ pub(crate) struct TruncLogNormDistributions {
 }
 
 impl TruncLogNormDistributions {
-    pub(crate) fn new(mus: Vec<f64>, sigmas: Vec<f64>, low: f64, high: f64) -> Self {
-        let ln_low = low.ln();
-        let ln_high = high.ln();
-        let log_consts = mus
-            .iter()
-            .zip(sigmas.iter())
-            .map(|(&mu, &sigma)| {
-                let ln_mass =
-                    truncnorm::log_diff_cdf((ln_low - mu) / sigma, (ln_high - mu) / sigma)
-                        .unwrap_or(f64::NEG_INFINITY);
-                if ln_mass == f64::NEG_INFINITY {
-                    f64::NEG_INFINITY
-                } else {
-                    NEG_HALF_LOG_2PI - sigma.ln() - ln_mass
-                }
-            })
-            .collect();
-        Self {
-            mus,
-            sigmas,
-            low,
-            high,
-            log_consts,
-        }
-    }
-
     /// Adds each kernel's log PDF at ln_x into `acc`.
     pub(crate) fn accumulate_log_pdf(&self, ln_x: f64, acc: &mut [f64]) {
         for (k, a) in acc.iter_mut().enumerate() {
@@ -322,6 +337,68 @@ pub(crate) enum Distributions {
 }
 
 impl Distributions {
+    /// Builds the distribution and recycles old allocations into the shared workspace.
+    pub(crate) fn from_numerical(
+        parameters: &mut NumericalParameters,
+        previous: Option<(Self, &[Option<usize>])>,
+        constants: &mut Vec<f64>,
+    ) -> Self {
+        let (old, indices) = previous
+            .and_then(|(distribution, indices)| {
+                let (old_low, old_high, mus, sigmas, log_consts) =
+                    match (distribution, parameters.log) {
+                        (Self::TruncNorm(d), false) => {
+                            (d.low, d.high, d.mus, d.sigmas, d.log_consts)
+                        }
+                        (Self::TruncLogNorm(d), true) => {
+                            (d.low, d.high, d.mus, d.sigmas, d.log_consts)
+                        }
+                        _ => return None,
+                    };
+                (parameters.step.is_none()
+                    && old_low.to_bits() == parameters.low.to_bits()
+                    && old_high.to_bits() == parameters.high.to_bits())
+                .then_some((
+                    NormalBuffers {
+                        mus,
+                        sigmas,
+                        log_consts,
+                    },
+                    indices,
+                ))
+            })
+            .unwrap_or_default();
+        if parameters.step.is_none() {
+            normal_log_constants(parameters, &old, indices, constants);
+        }
+        let mus = std::mem::replace(&mut parameters.mus, old.mus);
+        let sigmas = std::mem::replace(&mut parameters.sigmas, old.sigmas);
+        let log_consts = std::mem::replace(constants, old.log_consts);
+        let (low, high) = (parameters.low, parameters.high);
+        match (parameters.step, parameters.log) {
+            (None, false) => Self::TruncNorm(TruncNormDistributions {
+                mus,
+                sigmas,
+                low,
+                high,
+                log_consts,
+            }),
+            (None, true) => Self::TruncLogNorm(TruncLogNormDistributions {
+                mus,
+                sigmas,
+                low,
+                high,
+                log_consts,
+            }),
+            (Some(step), false) => Self::DiscreteTruncNorm(DiscreteTruncNormDistributions::new(
+                mus, sigmas, low, high, step,
+            )),
+            (Some(step), true) => Self::DiscreteTruncLogNorm(
+                DiscreteTruncLogNormDistributions::new(mus, sigmas, low, high, step),
+            ),
+        }
+    }
+
     pub(crate) fn n_kernels(&self) -> usize {
         match self {
             Self::TruncNorm(d) => d.mus.len(),
@@ -580,18 +657,48 @@ mod tests {
     use rand::SeedableRng;
 
     #[test]
+    fn unchanged_normalizers_are_reused_after_removing_an_observation() {
+        let previous = NormalBuffers {
+            mus: vec![0.2, 0.4, 0.5],
+            sigmas: vec![0.3; 3],
+            log_consts: vec![10.0, 20.0, 30.0], // Markers distinguish reuse from recomputation.
+        };
+        let parameters = NumericalParameters {
+            mus: vec![0.4, 0.5],
+            sigmas: vec![0.3; 2],
+            low: 0.0,
+            high: 1.0,
+            ..Default::default()
+        };
+        let mut constants = Vec::new();
+        normal_log_constants(&parameters, &previous, &[Some(1)], &mut constants);
+        assert_eq!(constants, [20.0, 30.0]); // Retained observation and prior.
+    }
+
+    #[test]
     fn test_mixture_of_product_distribution() {
-        let truncnorm_dist = TruncNormDistributions::new(
-            vec![-0.5, 0.0], // mus[-1] is prior
-            vec![2.0, 1.0],  // sigma[-1] is prior
-            -1.0,
-            1.0,
+        let truncnorm_dist = Distributions::from_numerical(
+            &mut NumericalParameters {
+                mus: vec![-0.5, 0.0],
+                sigmas: vec![2.0, 1.0],
+                low: -1.0,
+                high: 1.0,
+                ..Default::default()
+            },
+            None,
+            &mut Vec::new(),
         );
-        let trunclognorm_dist = TruncLogNormDistributions::new(
-            vec![2.0, 3.0], // ditto
-            vec![2.0, 1.0], // ditto
-            1.0,
-            5.0,
+        let trunclognorm_dist = Distributions::from_numerical(
+            &mut NumericalParameters {
+                mus: vec![2.0, 3.0],
+                sigmas: vec![2.0, 1.0],
+                low: 1.0,
+                high: 5.0,
+                log: true,
+                ..Default::default()
+            },
+            None,
+            &mut Vec::new(),
         );
         let discrete_truncnorm_dist = DiscreteTruncNormDistributions::new(
             vec![-0.5, 0.0], // ditto
@@ -609,14 +716,8 @@ mod tests {
         );
         let categorical_dist = CategoricalDistributions::new([0.0], 2);
         let mut distributions = vec![
-            (
-                "param_truncnorm".to_string(),
-                Distributions::TruncNorm(truncnorm_dist),
-            ),
-            (
-                "param_trunclognorm".to_string(),
-                Distributions::TruncLogNorm(trunclognorm_dist),
-            ),
+            ("param_truncnorm".to_string(), truncnorm_dist),
+            ("param_trunclognorm".to_string(), trunclognorm_dist),
             (
                 "param_discretetruncnorm".to_string(),
                 Distributions::DiscreteTruncNorm(discrete_truncnorm_dist),

@@ -1,52 +1,16 @@
 use rand::rngs::StdRng;
-use std::{borrow::Cow, collections::HashMap, vec};
+use std::{collections::HashMap, vec};
 
 use super::probability_distributions::CategoricalDistributions;
 use super::probability_distributions::{
-    DiscreteTruncLogNormDistributions, DiscreteTruncNormDistributions, Distributions,
-    MixtureOfProductDistribution, TruncLogNormDistributions, TruncNormDistributions,
+    Distributions, MixtureOfProductDistribution, NumericalParameters,
 };
 use crate::distribution::Distribution;
 use crate::parzen_estimator::scott::ScottNumericalDistributionBuilder;
 
 pub struct ParzenEstimator {
     mixuture_distribution: MixtureOfProductDistribution,
-}
-
-enum ObservationValues<'a, I> {
-    Borrowed(&'a [f64]),
-    Selected(I),
-}
-
-impl<'a, I: Iterator<Item = f64>> ObservationValues<'a, I> {
-    fn into_slice(self) -> Cow<'a, [f64]> {
-        match self {
-            Self::Borrowed(values) => Cow::Borrowed(values),
-            Self::Selected(values) => Cow::Owned(values.collect()),
-        }
-    }
-}
-
-impl<I: Iterator<Item = f64>> Iterator for ObservationValues<'_, I> {
-    type Item = f64;
-
-    fn next(&mut self) -> Option<f64> {
-        match self {
-            Self::Borrowed(values) => {
-                let (value, rest) = values.split_first()?;
-                *values = rest;
-                Some(*value)
-            }
-            Self::Selected(values) => values.next(),
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Borrowed(values) => (values.len(), Some(values.len())),
-            Self::Selected(values) => values.size_hint(),
-        }
-    }
+    observation_ids: Vec<u32>,
 }
 
 impl ParzenEstimator {
@@ -111,42 +75,63 @@ impl ParzenEstimator {
                 (
                     key.as_str(),
                     &search_space[key],
-                    ObservationValues::<std::iter::Empty<f64>>::Borrowed(
-                        observations.get(key).map(Vec::as_slice).unwrap_or(&[]),
-                    ),
+                    observations
+                        .get(key)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[])
+                        .iter()
+                        .copied(),
                 )
             }),
             weights,
             prior_weight,
             num_builder,
             cat_builder,
+            None,
         )
     }
 
     /// Builds a model from columns in strictly increasing parameter-name order.
-    /// Each column must provide one value for each observation weight.
+    /// Each column and the strictly increasing observation IDs must match the weights.
+    /// An optional previous model supplies buffers and unchanged density coefficients.
     pub fn from_ordered_observations<'a, I, V>(
         parameters: I,
+        observation_ids: Vec<u32>,
         weights: &[f64],
         prior_weight: f64,
+        previous: Option<Self>,
     ) -> Self
     where
         I: IntoIterator<Item = (&'a str, &'a Distribution, V)>,
         V: IntoIterator<Item = f64>,
     {
-        let model = Self::with_ordered_builder(
-            parameters.into_iter().map(|(name, distribution, values)| {
-                (
-                    name,
-                    distribution,
-                    ObservationValues::Selected(values.into_iter()),
-                )
-            }),
+        assert_eq!(observation_ids.len(), weights.len());
+        assert!(
+            observation_ids.windows(2).all(|ids| ids[0] < ids[1]),
+            "Observation IDs must be sorted and unique"
+        );
+        let mut indices = Vec::new();
+        if let Some(model) = &previous {
+            let old_ids = &model.observation_ids;
+            let mut old = 0;
+            for id in &observation_ids {
+                while old < old_ids.len() && old_ids[old] < *id {
+                    old += 1;
+                }
+                indices.push((old_ids.get(old) == Some(id)).then_some(old));
+            }
+        }
+        let mut model = Self::with_ordered_builder(
+            parameters
+                .into_iter()
+                .map(|(name, distribution, values)| (name, distribution, values.into_iter())),
             weights,
             prior_weight,
             &DefaultNumericalDistributionBuilder,
             &DefaultCategoricalDistributionBuilder,
+            previous.map(|model| (model, indices.as_slice())),
         );
+        model.observation_ids = observation_ids;
         assert!(
             model
                 .mixuture_distribution
@@ -164,12 +149,23 @@ impl ParzenEstimator {
         prior_weight: f64,
         num_builder: &impl NumericalDistributionBuilder,
         cat_builder: &impl CategoricalDistributionBuilder,
+        previous: Option<(Self, &[Option<usize>])>,
     ) -> Self
     where
-        I: IntoIterator<Item = (&'a str, &'a Distribution, ObservationValues<'a, V>)>,
+        I: IntoIterator<Item = (&'a str, &'a Distribution, V)>,
         V: Iterator<Item = f64>,
     {
         let parameters = parameters.into_iter();
+        let (old_names, old_distributions, indices) = match previous {
+            Some((model, indices)) => {
+                let m = model.mixuture_distribution;
+                (m.param_names, m.distributions, indices)
+            }
+            None => (Vec::new(), Vec::new(), &[][..]),
+        };
+        let mut old = old_names.into_iter().zip(old_distributions);
+        let mut parameters_buffer = NumericalParameters::default();
+        let mut constants = Vec::new();
         let mut distributions: Vec<(String, Distributions)> =
             Vec::with_capacity(parameters.size_hint().0);
         for (name, search_space, values) in parameters {
@@ -179,10 +175,33 @@ impl ParzenEstimator {
                     "Parameter names must be sorted and unique"
                 );
             }
+            let reuse = old
+                .next()
+                .filter(|(old_name, _)| old_name == name)
+                .map(|(_, distribution)| (distribution, indices));
             let distribution = match search_space {
                 Distribution::Float { .. } | Distribution::Int { .. } => {
-                    let values = values.into_slice();
-                    num_builder.calculate_numerical_distribution(&values, search_space)
+                    let (low, high, step, log) = match search_space {
+                        Distribution::Float {
+                            low,
+                            high,
+                            step,
+                            log,
+                        } => (*low, *high, *step, *log),
+                        Distribution::Int {
+                            low,
+                            high,
+                            step,
+                            log,
+                        } => (*low as f64, *high as f64, Some(*step as f64), *log),
+                        _ => unreachable!(),
+                    };
+                    parameters_buffer.low = low;
+                    parameters_buffer.high = high;
+                    parameters_buffer.step = step;
+                    parameters_buffer.log = log;
+                    num_builder.calculate_parameters(values, &mut parameters_buffer);
+                    Distributions::from_numerical(&mut parameters_buffer, reuse, &mut constants)
                 }
                 Distribution::Categorical { .. } => {
                     cat_builder.calculate_categorical_distribution(values.into_iter(), search_space)
@@ -207,6 +226,7 @@ impl ParzenEstimator {
             .collect();
 
         Self {
+            observation_ids: Vec::new(),
             mixuture_distribution: MixtureOfProductDistribution::new(
                 distributions,
                 weights_with_prior_weight,
@@ -240,11 +260,11 @@ impl ParzenEstimator {
 }
 
 pub(crate) trait NumericalDistributionBuilder {
-    fn calculate_numerical_distribution(
+    fn calculate_parameters(
         &self,
-        observations: &[f64],
-        search_space: &Distribution,
-    ) -> Distributions;
+        observations: impl Iterator<Item = f64>,
+        parameters: &mut NumericalParameters,
+    );
 }
 
 pub(crate) trait CategoricalDistributionBuilder {
@@ -264,7 +284,7 @@ pub(crate) struct DefaultCategoricalDistributionBuilder;
 /// A neighbor nearer than `minsigma` cannot lift that floor, and binning at that width hides
 /// exactly those: within a bin only the extremes can have a farther neighbor, and it is the
 /// adjacent non-empty bin's extreme. The per-bin extremes therefore give every bandwidth.
-fn binned_sigmas(obs: &[f64], low: f64, high: f64) -> Option<Vec<f64>> {
+fn binned_sigmas(obs: &[f64], low: f64, high: f64, sigmas: &mut Vec<f64>) -> Option<()> {
     if obs.len() < 2 {
         // No inter-observation neighbor exists; the caller falls back to endpoint distances.
         return None;
@@ -288,7 +308,8 @@ fn binned_sigmas(obs: &[f64], low: f64, high: f64) -> Option<Vec<f64>> {
         }
     }
 
-    let mut sigmas = vec![minsigma; obs.len()];
+    sigmas.resize(obs.len(), minsigma);
+    sigmas.fill(minsigma);
     let (mut prev_max, mut next_min) = (f64::NAN, f64::NAN);
     for bin in bins.iter().filter(|b| b.0 <= b.2) {
         sigmas[bin.1] = sigmas[bin.1].max(bin.0 - prev_max);
@@ -298,54 +319,47 @@ fn binned_sigmas(obs: &[f64], low: f64, high: f64) -> Option<Vec<f64>> {
         sigmas[bin.3] = sigmas[bin.3].max(next_min - bin.2);
         next_min = bin.0;
     }
-    Some(sigmas)
+    Some(())
 }
 
 impl NumericalDistributionBuilder for DefaultNumericalDistributionBuilder {
-    fn calculate_numerical_distribution(
+    fn calculate_parameters(
         &self,
-        observations: &[f64],
-        search_space: &Distribution,
-    ) -> Distributions {
+        observations: impl Iterator<Item = f64>,
+        parameters: &mut NumericalParameters,
+    ) {
         // Currently, we assume consider_prior=True, consider_endpoints=False, and consider_magic_clip=True.
-        let (low, high, step_opt, log) = match search_space {
-            Distribution::Float {
-                low,
-                high,
-                step,
-                log,
-            } => (*low, *high, *step, *log),
-            Distribution::Int {
-                low,
-                high,
-                step,
-                log,
-            } => (*low as f64, *high as f64, Some(*step as f64), *log),
-            _ => unreachable!("Invalid distribution type for numerical calculation"),
-        };
-
+        let NumericalParameters {
+            mus,
+            sigmas,
+            low,
+            high,
+            step,
+            log,
+        } = parameters;
+        let (low, high, step_opt, log) = (*low, *high, *step, *log);
         let (mut adj_low, mut adj_high) = match step_opt {
             Some(s) => (low - s / 2.0, high + s / 2.0),
             None => (low, high),
         };
 
+        mus.clear();
+        mus.extend(observations);
         if log {
             adj_low = adj_low.ln();
             adj_high = adj_high.ln();
+            for mu in mus.iter_mut() {
+                *mu = mu.ln();
+            }
         }
+        mus.push((adj_low + adj_high) / 2.0);
 
-        let mus = observations
-            .iter()
-            .map(|&m| if log { m.ln() } else { m })
-            .chain(std::iter::once((adj_low + adj_high) / 2.0)) // Add prior
-            .collect::<Vec<_>>();
-
-        let mut sigmas = Vec::with_capacity(mus.len() + 1); // +1 for prior
+        sigmas.clear();
+        sigmas.reserve(mus.len());
         if mus.len() == 1 {
             // Case: prior only
             sigmas.push(adj_high - adj_low);
-        } else if let Some(binned) = binned_sigmas(&mus[..mus.len() - 1], adj_low, adj_high) {
-            sigmas = binned;
+        } else if binned_sigmas(&mus[..mus.len() - 1], adj_low, adj_high, sigmas).is_some() {
             // Sigma for prior
             sigmas.push(adj_high - adj_low);
         } else {
@@ -378,21 +392,6 @@ impl NumericalDistributionBuilder for DefaultNumericalDistributionBuilder {
                 *s = s.clamp(minsigma, maxsigma);
             }
         }
-
-        match (step_opt, log) {
-            (None, false) => {
-                Distributions::TruncNorm(TruncNormDistributions::new(mus, sigmas, low, high))
-            }
-            (None, true) => {
-                Distributions::TruncLogNorm(TruncLogNormDistributions::new(mus, sigmas, low, high))
-            }
-            (Some(step), false) => Distributions::DiscreteTruncNorm(
-                DiscreteTruncNormDistributions::new(mus, sigmas, low, high, step),
-            ),
-            (Some(step), true) => Distributions::DiscreteTruncLogNorm(
-                DiscreteTruncLogNormDistributions::new(mus, sigmas, low, high, step),
-            ),
-        }
     }
 }
 
@@ -415,6 +414,70 @@ impl CategoricalDistributionBuilder for DefaultCategoricalDistributionBuilder {
 mod tests {
     use super::*;
     use rand::{Rng, SeedableRng};
+
+    #[test]
+    fn reused_normalizers_match_rebuilt_models_across_history_changes() {
+        let mut previous = None;
+        let mut rng = StdRng::seed_from_u64(931);
+        // A tight cluster lets a mean change while its clipped bandwidth stays unchanged.
+        let values: Vec<f64> = (0..150).map(|_| rng.gen_range(0.55..0.57)).collect();
+        for (step, n) in [1, 2, 30, 97, 98, 99, 140, 139, 130, 145, 145]
+            .into_iter()
+            .enumerate()
+        {
+            let mut ids: Vec<u32> = (0..n).collect();
+            if step >= 7 {
+                ids.retain(|&id| id != 17);
+            }
+            let observations: Vec<f64> = ids
+                .iter()
+                .map(|&id| {
+                    if step >= 8 && id == 3 {
+                        0.56
+                    } else {
+                        values[id as usize]
+                    }
+                })
+                .collect();
+            // Keep the width unchanged when shifting bounds, to exercise coefficient invalidation.
+            let shift = if step >= 9 { 0.25 } else { 0.0 };
+            let space = Distribution::new_float(0.25 + shift, 5.25 + shift, None, step >= 10);
+            let other_space = Distribution::new_float(0.1, 7.0, None, true);
+            let weights: Vec<f64> = (0..ids.len()).map(|i| (i + step + 1) as f64).collect();
+            let parameters = || {
+                [
+                    ("x", &space, observations.iter().copied()),
+                    ("y", &other_space, observations.iter().copied()),
+                ]
+            };
+            let fresh = ParzenEstimator::from_ordered_observations(
+                parameters(),
+                ids.clone(),
+                &weights,
+                1.0,
+                None,
+            );
+            let cached = ParzenEstimator::from_ordered_observations(
+                parameters(),
+                ids,
+                &weights,
+                1.0,
+                previous.take(),
+            );
+            let mut a = StdRng::seed_from_u64(42);
+            let mut b = StdRng::seed_from_u64(42);
+            let samples = fresh.sample_ordered(&mut a, 100);
+            assert_eq!(samples, cached.sample_ordered(&mut b, 100));
+            for x in &samples {
+                assert_eq!(
+                    fresh.log_pdf_ordered(x).to_bits(),
+                    cached.log_pdf_ordered(x).to_bits(),
+                    "step={step}"
+                );
+            }
+            previous = Some(cached);
+        }
+    }
 
     #[test]
     fn binned_sigmas_matches_a_naive_scan() {
@@ -444,7 +507,8 @@ mod tests {
                 (obs[0], obs[m - 1], obs[m / 2]) = (low, high, obs[m / 3]);
 
                 let minsigma = (high - low) / (100.0_f64.min(2.0 + m as f64));
-                let binned = binned_sigmas(&obs, low, high).unwrap();
+                let mut binned = Vec::new();
+                binned_sigmas(&obs, low, high, &mut binned).unwrap();
                 assert_eq!(binned, naive(&obs, minsigma), "m = {m}, spread = {spread}");
             }
         }
@@ -482,8 +546,10 @@ mod tests {
                     observations[name].iter().copied(),
                 )
             }),
+            vec![0, 1, 2],
             &[0.2, 0.5, 0.3],
             1.0,
+            None,
         );
         let mut rng = StdRng::seed_from_u64(42);
         let samples = parzen_estimator.sample(&mut rng, 10);
@@ -544,8 +610,10 @@ mod tests {
         let distribution = Distribution::new_categorical(3);
         let model = ParzenEstimator::from_ordered_observations(
             [("x", &distribution, std::iter::empty())],
+            Vec::new(),
             &[],
             1.0,
+            None,
         );
         for category in 0..3 {
             assert_eq!(
@@ -560,8 +628,10 @@ mod tests {
     fn ordered_observations_reject_inconsistent_weights() {
         ParzenEstimator::from_ordered_observations(
             [("x", &Distribution::new_categorical(3), [1.0, 2.0])],
+            vec![0],
             &[1.0],
             1.0,
+            None,
         );
     }
 
@@ -571,8 +641,10 @@ mod tests {
         let distribution = Distribution::new_categorical(3);
         ParzenEstimator::from_ordered_observations(
             [("b", &distribution, [0.0]), ("a", &distribution, [1.0])],
+            vec![0],
             &[1.0],
             1.0,
+            None,
         );
     }
 }

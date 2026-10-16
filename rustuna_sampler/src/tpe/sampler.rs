@@ -86,12 +86,14 @@ impl TpeBuilder {
             random_sampler: RandomSampler::seed_from_u64(seed_for_random_sampler),
             split_cache: RwLock::new(HashMap::new()),
             observations_cache: RwLock::new(ObservationsCache::default()),
+            estimator_cache: Mutex::new(HashMap::new()),
         }
     }
 }
 
 type SplitKey = (Vec<u32>, usize);
 type SplitValue = (HashSet<u32>, HashSet<u32>);
+
 /// Identity of the storage allocation that owns a study's trial IDs.
 #[derive(Clone)]
 struct StorageKey(Weak<RwLock<dyn Storage>>);
@@ -371,6 +373,7 @@ pub struct TpeSampler {
     /// Study columns are retained between trials. Storage is locked before
     /// this cache during updates; both are released before model construction.
     observations_cache: RwLock<ObservationsCache>,
+    estimator_cache: Mutex<HashMap<Vec<String>, (ParzenEstimator, ParzenEstimator)>>,
 }
 impl Default for TpeSampler {
     fn default() -> Self {
@@ -403,16 +406,13 @@ impl TpeSampler {
         let n = observations.len();
         let is_multi_objective = ctx.directions.len() > 1;
 
-        let (pe_good, pe_poor) = if !is_multi_objective {
+        let (good_rows, poor_rows, good_recency_ramp) = if !is_multi_objective {
             let gamma = Self::gamma_for_single_objective(n);
             let direction: &Direction = &ctx.directions[0];
             let (good_rows, poor_rows) =
                 Self::split_rows_for_single_objective(observations, direction, gamma);
             // Single-objective: recency ramp for both l(x) and g(x) (Optuna default_weights).
-            (
-                Self::build_parzen_estimator(observations, &good_rows, true),
-                Self::build_parzen_estimator(observations, &poor_rows, true),
-            )
+            (good_rows, poor_rows, true)
         } else {
             let directions: &[Direction] = &ctx.directions;
             let gamma = Self::gamma_for_multi_objective(n);
@@ -468,13 +468,36 @@ impl TpeSampler {
                 };
             // Multi-objective: uniform weights for l(x) (below), recency ramp for g(x) (above),
             // matching Optuna's multi-objective TPE.
-            (
-                Self::build_parzen_estimator(observations, &good_rows, false),
-                Self::build_parzen_estimator(observations, &poor_rows, true),
-            )
+            (good_rows, poor_rows, false)
         };
 
-        assert_eq!(pe_good.parameter_names(), pe_poor.parameter_names());
+        let cache_key: Vec<String> = observations
+            .param_columns
+            .iter()
+            .map(|c| c.name.to_owned())
+            .collect();
+        let previous = self
+            .estimator_cache
+            .lock()
+            .map_err(|e| {
+                Error::with_reason(
+                    ErrorKind::SamplerError,
+                    format!("Failed to acquire estimator cache: {e}"),
+                )
+            })?
+            .remove(&cache_key);
+        let (previous_good, previous_poor) = previous
+            .map(|(good, poor)| (Some(good), Some(poor)))
+            .unwrap_or_default();
+        let good = Self::build_parzen_estimator(
+            observations,
+            &good_rows,
+            good_recency_ramp,
+            previous_good,
+        );
+        let poor = Self::build_parzen_estimator(observations, &poor_rows, true, previous_poor);
+
+        assert_eq!(good.parameter_names(), poor.parameter_names());
         let n_ei_candidates = 24;
         let mut samples_good = {
             let mut rng = self.rng.lock().map_err(|e| {
@@ -483,23 +506,35 @@ impl TpeSampler {
                     format!("Failed to acquire RNG guard: {e}"),
                 )
             })?;
-            pe_good.sample_ordered(&mut rng, n_ei_candidates)
+            good.sample_ordered(&mut rng, n_ei_candidates)
         };
         let mut best_idx = 0usize;
         let mut best_val = f64::NEG_INFINITY;
         for (i, s) in samples_good.iter().enumerate() {
-            let acquisition = pe_good.log_pdf_ordered(s) - pe_poor.log_pdf_ordered(s);
+            let acquisition = good.log_pdf_ordered(s) - poor.log_pdf_ordered(s);
             if acquisition > best_val {
                 best_val = acquisition;
                 best_idx = i;
             }
         }
-        Ok(pe_good
+        let result = good
             .parameter_names()
             .iter()
             .cloned()
             .zip(samples_good.swap_remove(best_idx))
-            .collect())
+            .collect();
+        let mut cache = self.estimator_cache.lock().map_err(|e| {
+            Error::with_reason(
+                ErrorKind::SamplerError,
+                format!("Failed to acquire estimator cache: {e}"),
+            )
+        })?;
+        // Bound retained search spaces; separate one-parameter entries support independent TPE.
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(cache_key, (good, poor));
+        Ok(result)
     }
 
     fn split_rows_for_single_objective(
@@ -711,6 +746,7 @@ impl TpeSampler {
         observations: &TpeObservationsView<'_>,
         rows: &[usize],
         recency_ramp: bool,
+        previous: Option<ParzenEstimator>,
     ) -> ParzenEstimator {
         let n_params = observations.param_columns.len();
         let n_trials = rows.len();
@@ -745,6 +781,10 @@ impl TpeSampler {
         };
         let active_weights: Vec<f64> = active_indices.iter().map(|&i| weights[i]).collect();
         let prior_weight = 1.0;
+        let ids: Vec<u32> = active_indices
+            .iter()
+            .map(|&i| observations.trial_numbers[order[i]])
+            .collect();
         ParzenEstimator::from_ordered_observations(
             observations.param_columns.iter().map(|column| {
                 (
@@ -753,8 +793,10 @@ impl TpeSampler {
                     order.iter().filter_map(|&row| column.at(row)),
                 )
             }),
+            ids,
             &active_weights,
             prior_weight,
+            previous,
         )
     }
 }
