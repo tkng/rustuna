@@ -92,6 +92,7 @@ impl TpeBuilder {
 
 type SplitKey = (Vec<u32>, usize);
 type SplitValue = (HashSet<u32>, HashSet<u32>);
+
 /// Identity of the storage allocation that owns a study's trial IDs.
 #[derive(Clone)]
 struct StorageKey(Weak<RwLock<dyn Storage>>);
@@ -120,6 +121,98 @@ struct StudyObservations {
     seen: Vec<Option<(u32, u32, TrialState)>>,
     observations: Arc<TpeObservationSet>,
     last_used: u64,
+    estimators: StudyEstimators,
+}
+
+enum EstimatorKey {
+    Joint(Vec<String>),
+    Independent(String),
+}
+
+struct CachedEstimators {
+    trial_id: u32,
+    good: ParzenEstimator,
+    poor: ParzenEstimator,
+}
+
+/// Models belong to the same storage/study as their observation history. Keep
+/// one current joint space and the independent parameters used by the latest
+/// trial, rather than retaining a fixed number of historical search spaces.
+#[derive(Default)]
+struct StudyEstimators {
+    trial_id: Option<u32>,
+    joint: Option<(Vec<String>, CachedEstimators)>,
+    independent: HashMap<String, CachedEstimators>,
+}
+
+impl StudyEstimators {
+    fn begin_trial(&mut self, trial_id: u32) {
+        if self.trial_id.is_none_or(|previous| trial_id > previous) {
+            if let Some(previous) = self.trial_id {
+                // Also prune callers that advance without using after_trial.
+                self.finish_trial(previous);
+            }
+            self.trial_id = Some(trial_id);
+        }
+    }
+
+    fn take(
+        &mut self,
+        trial_id: u32,
+        key: &EstimatorKey,
+    ) -> Option<(ParzenEstimator, ParzenEstimator)> {
+        self.begin_trial(trial_id);
+        // A slow earlier trial must not consume a newer trial's cached model.
+        if self.trial_id != Some(trial_id) {
+            return None;
+        }
+        let cached = match key {
+            EstimatorKey::Joint(names) => self
+                .joint
+                .take()
+                .filter(|(previous, _)| previous == names)
+                .map(|(_, cached)| cached),
+            EstimatorKey::Independent(name) => self.independent.remove(name),
+        }?;
+        Some((cached.good, cached.poor))
+    }
+
+    fn insert(
+        &mut self,
+        trial_id: u32,
+        key: EstimatorKey,
+        good: ParzenEstimator,
+        poor: ParzenEstimator,
+    ) {
+        if self.trial_id != Some(trial_id) {
+            return;
+        }
+        let cached = CachedEstimators {
+            trial_id,
+            good,
+            poor,
+        };
+        match key {
+            EstimatorKey::Joint(names) => self.joint = Some((names, cached)),
+            EstimatorKey::Independent(name) => {
+                self.independent.insert(name, cached);
+            }
+        }
+    }
+
+    fn finish_trial(&mut self, trial_id: u32) {
+        if self.trial_id == Some(trial_id) {
+            if self
+                .joint
+                .as_ref()
+                .is_some_and(|(_, cached)| cached.trial_id != trial_id)
+            {
+                self.joint = None;
+            }
+            self.independent
+                .retain(|_, cached| cached.trial_id == trial_id);
+        }
+    }
 }
 
 impl StudyObservations {
@@ -134,6 +227,7 @@ impl StudyObservations {
                 feasibles_violations: Vec::new(),
             }),
             last_used: 0,
+            estimators: StudyEstimators::default(),
         }
     }
 
@@ -398,21 +492,20 @@ impl TpeSampler {
     fn sample(
         &self,
         ctx: &Context,
+        storage: &Arc<RwLock<dyn Storage>>,
         observations: &TpeObservationsView<'_>,
+        cache_key: EstimatorKey,
     ) -> Result<HashMap<String, f64>> {
         let n = observations.len();
         let is_multi_objective = ctx.directions.len() > 1;
 
-        let (pe_good, pe_poor) = if !is_multi_objective {
+        let (good_rows, poor_rows, good_recency_ramp) = if !is_multi_objective {
             let gamma = Self::gamma_for_single_objective(n);
             let direction: &Direction = &ctx.directions[0];
             let (good_rows, poor_rows) =
                 Self::split_rows_for_single_objective(observations, direction, gamma);
             // Single-objective: recency ramp for both l(x) and g(x) (Optuna default_weights).
-            (
-                Self::build_parzen_estimator(observations, &good_rows, true),
-                Self::build_parzen_estimator(observations, &poor_rows, true),
-            )
+            (good_rows, poor_rows, true)
         } else {
             let directions: &[Direction] = &ctx.directions;
             let gamma = Self::gamma_for_multi_objective(n);
@@ -468,13 +561,34 @@ impl TpeSampler {
                 };
             // Multi-objective: uniform weights for l(x) (below), recency ramp for g(x) (above),
             // matching Optuna's multi-objective TPE.
-            (
-                Self::build_parzen_estimator(observations, &good_rows, false),
-                Self::build_parzen_estimator(observations, &poor_rows, true),
-            )
+            (good_rows, poor_rows, false)
         };
 
-        assert_eq!(pe_good.parameter_names(), pe_poor.parameter_names());
+        let study_key = (StorageKey(Arc::downgrade(storage)), ctx.study_id);
+        let previous = self
+            .observations_cache
+            .write()
+            .map_err(|e| {
+                Error::with_reason(
+                    ErrorKind::SamplerError,
+                    format!("Failed to acquire observations cache guard: {e}"),
+                )
+            })?
+            .studies
+            .get_mut(&study_key)
+            .and_then(|history| history.estimators.take(ctx.trial_id, &cache_key));
+        let (previous_good, previous_poor) = previous
+            .map(|(good, poor)| (Some(good), Some(poor)))
+            .unwrap_or_default();
+        let good = Self::build_parzen_estimator(
+            observations,
+            &good_rows,
+            good_recency_ramp,
+            previous_good,
+        );
+        let poor = Self::build_parzen_estimator(observations, &poor_rows, true, previous_poor);
+
+        assert_eq!(good.parameter_names(), poor.parameter_names());
         let n_ei_candidates = 24;
         let mut samples_good = {
             let mut rng = self.rng.lock().map_err(|e| {
@@ -483,23 +597,35 @@ impl TpeSampler {
                     format!("Failed to acquire RNG guard: {e}"),
                 )
             })?;
-            pe_good.sample_ordered(&mut rng, n_ei_candidates)
+            good.sample_ordered(&mut rng, n_ei_candidates)
         };
         let mut best_idx = 0usize;
         let mut best_val = f64::NEG_INFINITY;
         for (i, s) in samples_good.iter().enumerate() {
-            let acquisition = pe_good.log_pdf_ordered(s) - pe_poor.log_pdf_ordered(s);
+            let acquisition = good.log_pdf_ordered(s) - poor.log_pdf_ordered(s);
             if acquisition > best_val {
                 best_val = acquisition;
                 best_idx = i;
             }
         }
-        Ok(pe_good
+        let result = good
             .parameter_names()
             .iter()
             .cloned()
             .zip(samples_good.swap_remove(best_idx))
-            .collect())
+            .collect();
+        let mut cache = self.observations_cache.write().map_err(|e| {
+            Error::with_reason(
+                ErrorKind::SamplerError,
+                format!("Failed to acquire observations cache guard: {e}"),
+            )
+        })?;
+        if let Some(history) = cache.studies.get_mut(&study_key) {
+            history
+                .estimators
+                .insert(ctx.trial_id, cache_key, good, poor);
+        }
+        Ok(result)
     }
 
     fn split_rows_for_single_objective(
@@ -711,6 +837,7 @@ impl TpeSampler {
         observations: &TpeObservationsView<'_>,
         rows: &[usize],
         recency_ramp: bool,
+        previous: Option<ParzenEstimator>,
     ) -> ParzenEstimator {
         let n_params = observations.param_columns.len();
         let n_trials = rows.len();
@@ -745,6 +872,10 @@ impl TpeSampler {
         };
         let active_weights: Vec<f64> = active_indices.iter().map(|&i| weights[i]).collect();
         let prior_weight = 1.0;
+        let ids: Vec<u32> = active_indices
+            .iter()
+            .map(|&i| observations.trial_numbers[order[i]])
+            .collect();
         ParzenEstimator::from_ordered_observations(
             observations.param_columns.iter().map(|column| {
                 (
@@ -753,8 +884,10 @@ impl TpeSampler {
                     order.iter().filter_map(|&row| column.at(row)),
                 )
             }),
+            ids,
             &active_weights,
             prior_weight,
+            previous,
         )
     }
 }
@@ -768,6 +901,12 @@ impl Sampler for TpeSampler {
                 format!("Failed to acquire observations cache guard: {e}"),
             )
         })?;
+        if let Some(history) = cache
+            .studies
+            .get_mut(&(StorageKey(Arc::downgrade(&storage)), ctx.study_id))
+        {
+            history.estimators.begin_trial(ctx.trial_id);
+        }
         cache.per_trial.insert(
             (
                 StorageKey(Arc::downgrade(&storage)),
@@ -808,7 +947,12 @@ impl Sampler for TpeSampler {
                 .random_sampler
                 .sample_independent(ctx, storage, name, distribution);
         };
-        let params = self.sample(ctx, &observations.view(&search_space))?;
+        let params = self.sample(
+            ctx,
+            &storage,
+            &observations.view(&search_space),
+            EstimatorKey::Independent(name.to_owned()),
+        )?;
         Ok(params[name])
     }
 
@@ -843,7 +987,13 @@ impl Sampler for TpeSampler {
         let Some(observations) = self.observations_for_trial(ctx, &storage)? else {
             return Ok(HashMap::new());
         };
-        self.sample(ctx, &observations.view(search_space))
+        let observations = observations.view(search_space);
+        let names = observations
+            .param_columns
+            .iter()
+            .map(|column| column.name.to_owned())
+            .collect();
+        self.sample(ctx, &storage, &observations, EstimatorKey::Joint(names))
     }
 
     fn after_trial(
@@ -852,20 +1002,19 @@ impl Sampler for TpeSampler {
         storage: Arc<RwLock<dyn Storage>>,
         _state_values: &TrialStateValues,
     ) -> Result<()> {
-        self.observations_cache
-            .write()
-            .map_err(|e| {
-                Error::with_reason(
-                    ErrorKind::SamplerError,
-                    format!("Failed to acquire observations cache guard: {e}"),
-                )
-            })?
+        let mut cache = self.observations_cache.write().map_err(|e| {
+            Error::with_reason(
+                ErrorKind::SamplerError,
+                format!("Failed to acquire observations cache guard: {e}"),
+            )
+        })?;
+        let owner = StorageKey(Arc::downgrade(&storage));
+        cache
             .per_trial
-            .remove(&(
-                StorageKey(Arc::downgrade(&storage)),
-                ctx.study_id,
-                ctx.trial_id,
-            ));
+            .remove(&(owner.clone(), ctx.study_id, ctx.trial_id));
+        if let Some(history) = cache.studies.get_mut(&(owner, ctx.study_id)) {
+            history.estimators.finish_trial(ctx.trial_id);
+        }
         Ok(())
     }
 }
@@ -876,6 +1025,195 @@ mod tests {
     use rustuna_core::storage::InMemoryStorage;
     use rustuna_core::study::{create_study, Direction};
     use rustuna_core::study::{get_best_trial, get_pareto_front};
+
+    fn study_with_shared_sampler(
+        multivariate: bool,
+    ) -> (rustuna_core::study::Study, Arc<TpeSampler>) {
+        let sampler = Arc::new(
+            TpeBuilder::new()
+                .multivariate(multivariate)
+                .n_startup_trials(1)
+                .seed(0)
+                .build(),
+        );
+        let study = rustuna_core::study::create_study_with_arc(
+            "estimator-lifecycle",
+            Arc::new(RwLock::new(InMemoryStorage::new())),
+            sampler.clone(),
+            vec![Direction::Minimize],
+        )
+        .unwrap();
+        (study, sampler)
+    }
+
+    #[test]
+    fn independent_estimators_retain_all_active_parameters_and_drop_unused_ones() {
+        let (study, sampler) = study_with_shared_sampler(false);
+        let names: Vec<_> = (0..129).map(|i| format!("x{i:03}")).collect();
+        study
+            .optimize(
+                |mut trial| {
+                    let mut value = 0.0;
+                    for name in &names {
+                        value += *trial.suggest_categorical(name, &[0.0, 1.0])?;
+                    }
+                    Ok(vec![value])
+                },
+                3,
+            )
+            .unwrap();
+        let key = (StorageKey(Arc::downgrade(&study.storage)), study.id);
+        {
+            let cache = sampler.observations_cache.read().unwrap();
+            let models = &cache.studies[&key].estimators;
+            assert!(models.joint.is_none());
+            assert_eq!(models.independent.len(), names.len());
+            assert!(names
+                .iter()
+                .all(|name| models.independent.contains_key(name)));
+        }
+        study
+            .optimize(
+                |mut trial| Ok(vec![*trial.suggest_categorical(&names[0], &[0.0, 1.0])?]),
+                1,
+            )
+            .unwrap();
+        {
+            let cache = sampler.observations_cache.read().unwrap();
+            let models = &cache.studies[&key].estimators;
+            assert_eq!(models.independent.len(), 1);
+            assert!(models.independent.contains_key(&names[0]));
+        }
+        study.optimize(|_| Ok(vec![0.0]), 1).unwrap();
+        assert!(sampler.observations_cache.read().unwrap().studies[&key]
+            .estimators
+            .independent
+            .is_empty());
+    }
+
+    #[test]
+    fn joint_estimators_keep_only_the_current_space() {
+        let (study, sampler) = study_with_shared_sampler(true);
+        study
+            .optimize(
+                |mut trial| {
+                    let x = trial.suggest_float("x", 0.0, 1.0)?;
+                    let y = trial.suggest_float("y", 0.0, 1.0)?;
+                    Ok(vec![x + y])
+                },
+                3,
+            )
+            .unwrap();
+        let key = (StorageKey(Arc::downgrade(&study.storage)), study.id);
+        assert_eq!(
+            sampler.observations_cache.read().unwrap().studies[&key]
+                .estimators
+                .joint
+                .as_ref()
+                .unwrap()
+                .0,
+            ["x", "y"]
+        );
+        study
+            .optimize(|mut trial| Ok(vec![trial.suggest_float("x", 0.0, 1.0)?]), 2)
+            .unwrap();
+        {
+            let cache = sampler.observations_cache.read().unwrap();
+            let models = &cache.studies[&key].estimators;
+            assert_eq!(models.joint.as_ref().unwrap().0, ["x"]);
+            assert!(models.independent.is_empty());
+        }
+        let ctx = Context {
+            study_id: study.id,
+            trial_number: 5,
+            trial_id: 100,
+            directions: vec![Direction::Minimize],
+        };
+        sampler.before_trial(&ctx, study.storage.clone()).unwrap();
+        sampler
+            .after_trial(&ctx, study.storage.clone(), &TrialStateValues::Fail)
+            .unwrap();
+        assert!(sampler.observations_cache.read().unwrap().studies[&key]
+            .estimators
+            .joint
+            .is_none());
+    }
+
+    #[test]
+    fn estimator_models_belong_to_their_storage_and_study() {
+        let sampler = Arc::new(TpeBuilder::new().n_startup_trials(1).seed(0).build());
+        let shared_storage: Arc<RwLock<dyn Storage>> =
+            Arc::new(RwLock::new(InMemoryStorage::new()));
+        let make_study = |name, storage| {
+            rustuna_core::study::create_study_with_arc(
+                name,
+                storage,
+                sampler.clone(),
+                vec![Direction::Minimize],
+            )
+            .unwrap()
+        };
+        let first = make_study("first", shared_storage.clone());
+        let second = make_study("second", shared_storage);
+        let third = make_study("third", Arc::new(RwLock::new(InMemoryStorage::new())));
+        let third_key = (StorageKey(Arc::downgrade(&third.storage)), third.id);
+        for study in [&first, &second, &third] {
+            study
+                .optimize(|mut trial| Ok(vec![trial.suggest_float("x", 0.0, 1.0)?]), 3)
+                .unwrap();
+        }
+        {
+            let cache = sampler.observations_cache.read().unwrap();
+            assert_eq!(cache.studies.len(), 3);
+            assert!(cache
+                .studies
+                .values()
+                .all(|history| history.estimators.joint.is_some()));
+        }
+        drop(third);
+        first
+            .optimize(|mut trial| Ok(vec![trial.suggest_float("x", 0.0, 1.0)?]), 1)
+            .unwrap();
+        let cache = sampler.observations_cache.read().unwrap();
+        assert_eq!(cache.studies.len(), 2);
+        assert!(!cache.studies.contains_key(&third_key));
+    }
+
+    #[test]
+    fn older_trials_cannot_consume_or_replace_newer_estimators() {
+        let (study, sampler) = study_with_shared_sampler(false);
+        study
+            .optimize(
+                |mut trial| {
+                    let x = trial.suggest_float("x", 0.0, 1.0)?;
+                    let y = trial.suggest_float("y", 0.0, 1.0)?;
+                    Ok(vec![x + y])
+                },
+                3,
+            )
+            .unwrap();
+        let key = (StorageKey(Arc::downgrade(&study.storage)), study.id);
+        let mut cache = sampler.observations_cache.write().unwrap();
+        let models = &mut cache.studies.get_mut(&key).unwrap().estimators;
+        let newest = models.trial_id.unwrap();
+        let parameter = EstimatorKey::Independent("x".to_owned());
+        let (good, poor) = models.take(newest, &parameter).unwrap();
+        models.insert(newest, parameter, good, poor);
+        assert!(models
+            .take(newest - 1, &EstimatorKey::Independent("x".to_owned()))
+            .is_none());
+        models.finish_trial(newest - 1);
+        let cached = models.independent.remove("y").unwrap();
+        models.insert(
+            newest - 1,
+            EstimatorKey::Independent("stale".to_owned()),
+            cached.good,
+            cached.poor,
+        );
+        assert!(models.independent.contains_key("x"));
+        assert!(!models.independent.contains_key("stale"));
+        assert_eq!(models.trial_id, Some(newest));
+    }
 
     #[test]
     fn test_optimize() {
