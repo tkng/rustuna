@@ -18,7 +18,7 @@ impl<'a> ScottNumericalDistributionBuilder<'a> {
 impl<'a> NumericalDistributionBuilder for ScottNumericalDistributionBuilder<'a> {
     fn calculate_numerical_distribution(
         &self,
-        observations: &[f64],
+        observations: impl Iterator<Item = f64>,
         search_space: &Distribution,
     ) -> Distributions {
         // NOTE: Since the Optuna TPE bandwidth selection is too wide for this analysis, we use the Scott's rule:
@@ -47,12 +47,12 @@ impl<'a> NumericalDistributionBuilder for ScottNumericalDistributionBuilder<'a> 
             })
             .collect::<Vec<_>>();
         let weights_sum = weights_cum.last().cloned().unwrap_or(1.0);
-        let n_observations = observations.len();
-        let observations = if log {
-            observations.iter().map(|v| v.ln()).collect()
+        let observations: Vec<f64> = if log {
+            observations.map(|v| v.ln()).collect()
         } else {
-            observations.to_vec()
+            observations.collect()
         };
+        let n_observations = observations.len();
         let (low, high) = if log {
             (low.ln(), high.ln())
         } else {

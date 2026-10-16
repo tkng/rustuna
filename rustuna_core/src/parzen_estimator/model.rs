@@ -1,5 +1,5 @@
 use rand::rngs::StdRng;
-use std::{borrow::Cow, collections::HashMap, vec};
+use std::{collections::HashMap, vec};
 
 use super::probability_distributions::CategoricalDistributions;
 use super::probability_distributions::{
@@ -11,42 +11,6 @@ use crate::parzen_estimator::scott::ScottNumericalDistributionBuilder;
 
 pub struct ParzenEstimator {
     mixuture_distribution: MixtureOfProductDistribution,
-}
-
-enum ObservationValues<'a, I> {
-    Borrowed(&'a [f64]),
-    Selected(I),
-}
-
-impl<'a, I: Iterator<Item = f64>> ObservationValues<'a, I> {
-    fn into_slice(self) -> Cow<'a, [f64]> {
-        match self {
-            Self::Borrowed(values) => Cow::Borrowed(values),
-            Self::Selected(values) => Cow::Owned(values.collect()),
-        }
-    }
-}
-
-impl<I: Iterator<Item = f64>> Iterator for ObservationValues<'_, I> {
-    type Item = f64;
-
-    fn next(&mut self) -> Option<f64> {
-        match self {
-            Self::Borrowed(values) => {
-                let (value, rest) = values.split_first()?;
-                *values = rest;
-                Some(*value)
-            }
-            Self::Selected(values) => values.next(),
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Borrowed(values) => (values.len(), Some(values.len())),
-            Self::Selected(values) => values.size_hint(),
-        }
-    }
 }
 
 impl ParzenEstimator {
@@ -111,9 +75,12 @@ impl ParzenEstimator {
                 (
                     key.as_str(),
                     &search_space[key],
-                    ObservationValues::<std::iter::Empty<f64>>::Borrowed(
-                        observations.get(key).map(Vec::as_slice).unwrap_or(&[]),
-                    ),
+                    observations
+                        .get(key)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[])
+                        .iter()
+                        .copied(),
                 )
             }),
             weights,
@@ -135,13 +102,9 @@ impl ParzenEstimator {
         V: IntoIterator<Item = f64>,
     {
         let model = Self::with_ordered_builder(
-            parameters.into_iter().map(|(name, distribution, values)| {
-                (
-                    name,
-                    distribution,
-                    ObservationValues::Selected(values.into_iter()),
-                )
-            }),
+            parameters
+                .into_iter()
+                .map(|(name, distribution, values)| (name, distribution, values.into_iter())),
             weights,
             prior_weight,
             &DefaultNumericalDistributionBuilder,
@@ -166,7 +129,7 @@ impl ParzenEstimator {
         cat_builder: &impl CategoricalDistributionBuilder,
     ) -> Self
     where
-        I: IntoIterator<Item = (&'a str, &'a Distribution, ObservationValues<'a, V>)>,
+        I: IntoIterator<Item = (&'a str, &'a Distribution, V)>,
         V: Iterator<Item = f64>,
     {
         let parameters = parameters.into_iter();
@@ -181,11 +144,10 @@ impl ParzenEstimator {
             }
             let distribution = match search_space {
                 Distribution::Float { .. } | Distribution::Int { .. } => {
-                    let values = values.into_slice();
-                    num_builder.calculate_numerical_distribution(&values, search_space)
+                    num_builder.calculate_numerical_distribution(values, search_space)
                 }
                 Distribution::Categorical { .. } => {
-                    cat_builder.calculate_categorical_distribution(values.into_iter(), search_space)
+                    cat_builder.calculate_categorical_distribution(values, search_space)
                 }
             };
             distributions.push((name.to_owned(), distribution));
@@ -242,7 +204,7 @@ impl ParzenEstimator {
 pub(crate) trait NumericalDistributionBuilder {
     fn calculate_numerical_distribution(
         &self,
-        observations: &[f64],
+        observations: impl Iterator<Item = f64>,
         search_space: &Distribution,
     ) -> Distributions;
 }
@@ -304,7 +266,7 @@ fn binned_sigmas(obs: &[f64], low: f64, high: f64) -> Option<Vec<f64>> {
 impl NumericalDistributionBuilder for DefaultNumericalDistributionBuilder {
     fn calculate_numerical_distribution(
         &self,
-        observations: &[f64],
+        observations: impl Iterator<Item = f64>,
         search_space: &Distribution,
     ) -> Distributions {
         // Currently, we assume consider_prior=True, consider_endpoints=False, and consider_magic_clip=True.
@@ -335,8 +297,7 @@ impl NumericalDistributionBuilder for DefaultNumericalDistributionBuilder {
         }
 
         let mus = observations
-            .iter()
-            .map(|&m| if log { m.ln() } else { m })
+            .map(|m| if log { m.ln() } else { m })
             .chain(std::iter::once((adj_low + adj_high) / 2.0)) // Add prior
             .collect::<Vec<_>>();
 
