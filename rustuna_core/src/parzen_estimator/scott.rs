@@ -1,4 +1,4 @@
-use crate::parzen_estimator::model::NumericalDistributionBuilder;
+use crate::parzen_estimator::model::{BinState, NumericalDistributionBuilder};
 use crate::parzen_estimator::probability_distributions::NumericalParameters;
 
 pub(crate) struct ScottNumericalDistributionBuilder<'a> {
@@ -16,6 +16,8 @@ impl<'a> NumericalDistributionBuilder for ScottNumericalDistributionBuilder<'a> 
         &self,
         observations: impl Iterator<Item = f64>,
         parameters: &mut NumericalParameters,
+        _bins: &mut Option<BinState>,
+        _previous: Option<(&[f64], &[usize])>,
     ) {
         // NOTE: Since the Optuna TPE bandwidth selection is too wide for this analysis, we use the Scott's rule:
         // David W. Scott. 1992. Multivariate Density Estimation: Theory, Practice, and Visualization. John Wiley & Sons.
