@@ -346,7 +346,7 @@ fn binned_sigmas(obs: &[f64], low: f64, high: f64, sigmas: &mut Vec<f64>) -> Opt
             // The observation is outside the search space.
             return None;
         }
-        let bin = &mut bins[(((v - low) / minsigma) as usize).min(n_bins - 1)];
+        let bin = &mut bins[(((v - low) / minsigma) as u32 as usize).min(n_bins - 1)];
         if v < bin.0 {
             (bin.0, bin.1) = (v, i);
         }
