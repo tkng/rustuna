@@ -257,6 +257,53 @@ impl ParzenEstimator {
     pub fn log_pdf_ordered(&self, values: &[f64]) -> f64 {
         self.mixuture_distribution.log_pdf_ordered(values)
     }
+
+    /// Maximizes `self.log_pdf_ordered(x) - poor.log_pdf_ordered(x)`, keeping the first tie.
+    /// For joint models, prior-based upper bounds skip candidates that cannot win.
+    pub fn best_candidate_index(&self, poor: &Self, samples: &[Vec<f64>]) -> usize {
+        let mut ranked = Vec::new();
+        if self.parameter_names().len() > 1 {
+            ranked = samples
+                .iter()
+                .enumerate()
+                .map(|(i, x)| {
+                    let good = self.log_pdf_ordered(x);
+                    let bound = good - poor.mixuture_distribution.log_pdf_prior_ordered(x);
+                    // Unusable bounds must always receive a full evaluation.
+                    let upper = if bound.is_finite() {
+                        bound
+                    } else {
+                        f64::INFINITY
+                    };
+                    (i, good, upper)
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_unstable_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+        }
+        let mut best_idx = 0;
+        let mut best_val = f64::NEG_INFINITY;
+        for position in 0..samples.len() {
+            let (i, good, upper) = if ranked.is_empty() {
+                // A single prior is usually too weak a bound for independent TPE.
+                (
+                    position,
+                    self.log_pdf_ordered(&samples[position]),
+                    f64::INFINITY,
+                )
+            } else {
+                ranked[position]
+            };
+            if upper < best_val {
+                break;
+            }
+            let acquisition = good - poor.log_pdf_ordered(&samples[i]);
+            if acquisition > best_val || (acquisition == best_val && i < best_idx) {
+                best_val = acquisition;
+                best_idx = i;
+            }
+        }
+        best_idx
+    }
 }
 
 pub(crate) trait NumericalDistributionBuilder {
@@ -414,6 +461,38 @@ impl CategoricalDistributionBuilder for DefaultCategoricalDistributionBuilder {
 mod tests {
     use super::*;
     use rand::{Rng, SeedableRng};
+
+    #[test]
+    fn candidate_pruning_matches_exhaustive_scoring() {
+        let space = Distribution::new_float(-5.0, 5.0, None, false);
+        let model = |values: &[f64], prior| {
+            ParzenEstimator::from_ordered_observations(
+                ["x", "y"].map(|name| (name, &space, values.iter().copied())),
+                (0..values.len() as u32).collect(),
+                &vec![1.0; values.len()],
+                prior,
+                None,
+            )
+        };
+        let good = model(&[-3.0, -2.0, -1.0], 1.0);
+        for prior in [0.0, 1.0] {
+            let poor = model(&[-3.0, -2.0, -1.0, 0.0, 1.0, 2.0], prior);
+            let mut samples = good.sample_ordered(&mut StdRng::seed_from_u64(42), 24);
+            let invalid = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY].map(|v| vec![v; 2]);
+            assert_eq!(good.best_candidate_index(&poor, &invalid), 0);
+            samples.splice(0..0, invalid);
+            let (mut index, mut best) = (0, f64::NEG_INFINITY);
+            for (i, x) in samples.iter().enumerate() {
+                let score = good.log_pdf_ordered(x) - poor.log_pdf_ordered(x);
+                if score > best {
+                    (index, best) = (i, score);
+                }
+            }
+            assert_eq!(good.best_candidate_index(&poor, &samples), index);
+            let ties = [vec![4.9; 2], vec![0.0; 2]];
+            assert_eq!(poor.best_candidate_index(&poor, &ties), 0);
+        }
+    }
 
     #[test]
     fn reused_normalizers_match_rebuilt_models_across_history_changes() {

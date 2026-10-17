@@ -599,15 +599,7 @@ impl TpeSampler {
             })?;
             good.sample_ordered(&mut rng, n_ei_candidates)
         };
-        let mut best_idx = 0usize;
-        let mut best_val = f64::NEG_INFINITY;
-        for (i, s) in samples_good.iter().enumerate() {
-            let acquisition = good.log_pdf_ordered(s) - poor.log_pdf_ordered(s);
-            if acquisition > best_val {
-                best_val = acquisition;
-                best_idx = i;
-            }
-        }
+        let best_idx = good.best_candidate_index(&poor, &samples_good);
         let result = good
             .parameter_names()
             .iter()

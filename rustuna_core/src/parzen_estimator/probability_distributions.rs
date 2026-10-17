@@ -566,6 +566,36 @@ impl MixtureOfProductDistribution {
         self.log_pdf_values(values.iter().copied().map(Some))
     }
 
+    /// The weighted prior component bounds the mixture from below. Keep its arithmetic
+    /// identical to the corresponding component in `log_pdf_values`, including normalization.
+    pub(crate) fn log_pdf_prior_ordered(&self, values: &[f64]) -> f64 {
+        if values.len() != self.distributions.len() {
+            return f64::NEG_INFINITY;
+        }
+        let k = self.n_kernels - 1;
+        let mut score = 0.0;
+        for (dist, &x) in self.distributions.iter().zip(values) {
+            score += match dist {
+                Distributions::TruncNorm(d) if x >= d.low && x <= d.high => {
+                    let z = (x - d.mus[k]) / d.sigmas[k];
+                    d.log_consts[k] - 0.5 * z * z
+                }
+                Distributions::TruncLogNorm(d) if x > 0.0 && x >= d.low && x <= d.high => {
+                    let ln_x = x.ln();
+                    let z = (ln_x - d.mus[k]) / d.sigmas[k];
+                    d.log_consts[k] - 0.5 * z * z - ln_x
+                }
+                Distributions::DiscreteTruncNorm(d) => d.log_pdf(x, k),
+                Distributions::DiscreteTruncLogNorm(d) if x > 0.0 => d.log_pdf(x, k),
+                Distributions::Categorical(d) if (x as usize) < d.cardinality => {
+                    d.probability(k, x as usize).ln()
+                }
+                _ => return f64::NEG_INFINITY,
+            };
+        }
+        (score + self.log_weights[k]) - self.log_sum_weights
+    }
+
     fn log_pdf_values(&self, values: impl Iterator<Item = Option<f64>>) -> f64 {
         let n = self.n_kernels;
         let mut weighted_log_pdf = vec![0.0_f64; n];
@@ -741,6 +771,8 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let samples = mixture.sample(&mut rng, 10);
         for sample in samples.iter() {
+            let values: Vec<_> = mixture.param_names.iter().map(|key| sample[key]).collect();
+            assert!(mixture.log_pdf_prior_ordered(&values) <= mixture.log_pdf(sample));
             let val_truncnorm = sample.get("param_truncnorm").unwrap();
             assert!(*val_truncnorm >= -1.0 && *val_truncnorm <= 1.0);
             let val_trunclognorm = sample.get("param_trunclognorm").unwrap();
