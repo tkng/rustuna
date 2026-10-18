@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use super::truncnorm::NEG_HALF_LOG_2PI;
 
-/// Numerical kernel parameters, independent of cached density coefficients.
+/// Numerical kernel parameters and the kernels whose density coefficients may need updating.
 #[derive(Default)]
 pub(crate) struct NumericalParameters {
     pub mus: Vec<f64>,
@@ -15,6 +15,8 @@ pub(crate) struct NumericalParameters {
     pub high: f64,
     pub step: Option<f64>,
     pub log: bool,
+    // Nonempty only on bin reuse; flags new kernels and possibly changed widths.
+    pub updated: Vec<u64>,
 }
 
 /// Previous continuous-normal kernels, retained until the new coefficients are computed.
@@ -36,7 +38,40 @@ fn normal_log_constants(
     } else {
         (parameters.low, parameters.high)
     };
+    let compute = |mu: f64, sigma: f64| {
+        let ln_mass = truncnorm::log_diff_cdf((low - mu) / sigma, (high - mu) / sigma)
+            .unwrap_or(f64::NEG_INFINITY);
+        if ln_mass == f64::NEG_INFINITY {
+            f64::NEG_INFINITY
+        } else {
+            NEG_HALF_LOG_2PI - sigma.ln() - ln_mass
+        }
+    };
     constants.clear();
+    if !parameters.updated.is_empty() && !previous.mus.is_empty() {
+        // Bin reuse already verified retained means and the width floor. With finite bounds
+        // and positive finite widths these cached coefficients cannot be NaN.
+        let mut old_start = 0;
+        for (word, mut bits) in parameters.updated.iter().copied().enumerate() {
+            while bits != 0 {
+                let k = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                // All old observations are retained, and every insertion is flagged. Copy the
+                // unchanged span between flagged kernels without checking it kernel by kernel.
+                let len = k - constants.len();
+                constants.extend_from_slice(&previous.log_consts[old_start..old_start + len]);
+                constants.push(match indices[k] {
+                    Some(i) if previous.sigmas[i].to_bits() == parameters.sigmas[k].to_bits() => {
+                        previous.log_consts[i]
+                    }
+                    _ => compute(parameters.mus[k], parameters.sigmas[k]),
+                });
+                old_start += len + usize::from(indices[k].is_some());
+            }
+        }
+        constants.extend_from_slice(&previous.log_consts[old_start..]); // Includes prior.
+        return;
+    }
     constants.extend(
         parameters
             .mus
@@ -59,13 +94,7 @@ fn normal_log_constants(
                         }
                     }
                 }
-                let ln_mass = truncnorm::log_diff_cdf((low - mu) / sigma, (high - mu) / sigma)
-                    .unwrap_or(f64::NEG_INFINITY);
-                if ln_mass == f64::NEG_INFINITY {
-                    f64::NEG_INFINITY
-                } else {
-                    NEG_HALF_LOG_2PI - sigma.ln() - ln_mass
-                }
+                compute(mu, sigma)
             }),
     );
 }

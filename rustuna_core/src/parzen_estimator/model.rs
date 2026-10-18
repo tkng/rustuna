@@ -158,6 +158,7 @@ impl ParzenEstimator {
     {
         let parameters = parameters.into_iter();
         let mut positions = Vec::new();
+        let mut added = Vec::new();
         let (old_names, old_distributions, old_bins, indices) = match previous {
             Some((model, indices)) => {
                 // Invert the shared ID mapping once for all parameter columns.
@@ -165,6 +166,8 @@ impl ParzenEstimator {
                 for (new, old) in indices.iter().enumerate() {
                     if let Some(old) = old {
                         positions[*old] = new;
+                    } else {
+                        added.push(new);
                     }
                 }
                 let m = model.mixuture_distribution;
@@ -220,7 +223,7 @@ impl ParzenEstimator {
                         values,
                         &mut parameters_buffer,
                         &mut bins,
-                        previous.map(|mus| (mus, positions.as_slice())),
+                        previous.map(|mus| (mus, positions.as_slice(), added.as_slice())),
                     );
                     Distributions::from_numerical(&mut parameters_buffer, reuse, &mut constants)
                 }
@@ -336,7 +339,7 @@ pub(crate) trait NumericalDistributionBuilder {
         observations: impl Iterator<Item = f64>,
         parameters: &mut NumericalParameters,
         bins: &mut Option<BinState>,
-        previous: Option<(&[f64], &[usize])>,
+        previous: Option<(&[f64], &[usize], &[usize])>,
     );
 }
 
@@ -371,8 +374,10 @@ fn binned_sigmas(
     high: f64,
     sigmas: &mut Vec<f64>,
     cache: &mut Option<BinState>,
-    previous: Option<(&[f64], &[usize])>,
+    previous: Option<(&[f64], &[usize], &[usize])>,
+    updated: &mut Vec<u64>,
 ) -> Option<()> {
+    updated.clear();
     if obs.len() < 2 {
         // No inter-observation neighbor exists; the caller falls back to endpoint distances.
         *cache = None;
@@ -383,7 +388,7 @@ fn binned_sigmas(
     let minsigma = (high - low) / n_bins as f64;
 
     let mut state = cache.take().unwrap_or_default();
-    let (mus, positions) = previous.unwrap_or_default();
+    let (mus, positions, added) = previous.unwrap_or_default();
     let reuse = state.low.to_bits() == low.to_bits()
         && state.high.to_bits() == high.to_bits()
         && state.bins.len() == n_bins
@@ -394,8 +399,8 @@ fn binned_sigmas(
             .all(|(old, &new)| obs.get(new).map(|v| v.to_bits()) == Some(mus[old].to_bits()));
     let empty = (f64::INFINITY, 0_usize, f64::NEG_INFINITY, 0_usize);
     state.bins.resize(n_bins, empty);
-    let positions = if reuse { positions } else { &[] };
     if reuse {
+        updated.resize(obs.len().div_ceil(64), 0);
         for bin in state.bins.iter_mut().filter(|bin| bin.0 <= bin.2) {
             bin.1 = positions[bin.1];
             bin.3 = positions[bin.3];
@@ -403,22 +408,35 @@ fn binned_sigmas(
     } else {
         state.bins.fill(empty);
     }
-    let mut retained = positions.iter().copied().peekable();
-    for (i, &v) in obs.iter().enumerate() {
-        if retained.peek() == Some(&i) {
-            retained.next();
-            continue;
+    let mut changed_bins = 0_u128;
+    let added = if reuse { added } else { &[] };
+    let rebuild_len = if reuse { 0 } else { obs.len() };
+    for i in added.iter().copied().chain(0..rebuild_len) {
+        let v = obs[i];
+        if reuse {
+            updated[i / 64] |= 1 << (i % 64);
         }
         if !(low..=high).contains(&v) {
             // The observation is outside the search space.
+            updated.clear();
             return None;
         }
-        let bin = &mut state.bins[(((v - low) / minsigma) as u32 as usize).min(n_bins - 1)];
+        let index = (((v - low) / minsigma) as u32 as usize).min(n_bins - 1);
+        let bin = &mut state.bins[index];
+        let changes_min = v < bin.0 || (v == bin.0 && i < bin.1);
+        let changes_max = v > bin.2 || (v == bin.2 && i >= bin.3);
+        if reuse && (changes_min || changes_max) {
+            changed_bins |= 1 << index;
+            // A displaced extreme returns to the width floor.
+            for old in [bin.1, bin.3] {
+                updated[old / 64] |= 1 << (old % 64);
+            }
+        }
         // Insertions can precede retained observations: keep the original tie order.
-        if v < bin.0 || (v == bin.0 && i < bin.1) {
+        if changes_min {
             (bin.0, bin.1) = (v, i);
         }
-        if v > bin.2 || (v == bin.2 && i >= bin.3) {
+        if changes_max {
             (bin.2, bin.3) = (v, i);
         }
     }
@@ -434,6 +452,21 @@ fn binned_sigmas(
         sigmas[bin.3] = sigmas[bin.3].max(next_min - bin.2);
         next_min = bin.0;
     }
+    // Only changed bins and their nearest non-empty neighbors can change widths.
+    while changed_bins != 0 {
+        let index = changed_bins.trailing_zeros() as usize;
+        changed_bins &= changed_bins - 1;
+        let neighbors = [
+            state.bins[..index].iter().rfind(|b| b.0 <= b.2),
+            Some(&state.bins[index]),
+            state.bins[index + 1..].iter().find(|b| b.0 <= b.2),
+        ];
+        for bin in neighbors.into_iter().flatten() {
+            for i in [bin.1, bin.3] {
+                updated[i / 64] |= 1 << (i % 64);
+            }
+        }
+    }
     if n_bins == 100 && minsigma.is_finite() && minsigma > 0.0 && previous.is_some() {
         (state.low, state.high) = (low, high);
         *cache = Some(state);
@@ -447,7 +480,7 @@ impl NumericalDistributionBuilder for DefaultNumericalDistributionBuilder {
         observations: impl Iterator<Item = f64>,
         parameters: &mut NumericalParameters,
         bins: &mut Option<BinState>,
-        previous: Option<(&[f64], &[usize])>,
+        previous: Option<(&[f64], &[usize], &[usize])>,
     ) {
         // Currently, we assume consider_prior=True, consider_endpoints=False, and consider_magic_clip=True.
         let NumericalParameters {
@@ -457,7 +490,9 @@ impl NumericalDistributionBuilder for DefaultNumericalDistributionBuilder {
             high,
             step,
             log,
+            updated,
         } = parameters;
+        updated.clear();
         let (low, high, step_opt, log) = (*low, *high, *step, *log);
         let (mut adj_low, mut adj_high) = match step_opt {
             Some(s) => (low - s / 2.0, high + s / 2.0),
@@ -488,6 +523,7 @@ impl NumericalDistributionBuilder for DefaultNumericalDistributionBuilder {
             sigmas,
             bins,
             previous,
+            updated,
         )
         .is_some()
         {
@@ -582,8 +618,10 @@ mod tests {
     fn reused_normalizers_match_rebuilt_models_across_history_changes() {
         let mut previous = None;
         let mut rng = StdRng::seed_from_u64(931);
-        // A tight cluster lets a mean change while its clipped bandwidth stays unchanged.
-        let values: Vec<f64> = (0..150).map(|_| rng.gen_range(0.55..0.57)).collect();
+        // Mix a tight cluster with sparse observations to exercise clipped and changing widths.
+        let values: Vec<f64> = (0..150)
+            .map(|i| rng.gen_range(if i % 3 == 0 { 0.55..0.57 } else { 0.6..5.0 }))
+            .collect();
         for (step, n) in [1, 2, 30, 97, 98, 99, 140, 139, 130, 145, 145]
             .into_iter()
             .enumerate()
@@ -670,8 +708,8 @@ mod tests {
                 (obs[0], obs[m - 1], obs[m / 2]) = (low, high, obs[m / 3]);
 
                 let minsigma = (high - low) / (100.0_f64.min(2.0 + m as f64));
-                let mut binned = Vec::new();
-                binned_sigmas(&obs, low, high, &mut binned, &mut None, None).unwrap();
+                let (mut binned, mut updated) = (Vec::new(), Vec::new());
+                binned_sigmas(&obs, low, high, &mut binned, &mut None, None, &mut updated).unwrap();
                 assert_eq!(binned, naive(&obs, minsigma), "m = {m}, spread = {spread}");
             }
         }
@@ -682,17 +720,25 @@ mod tests {
         let mut obs = vec![0.0; 100];
         obs[..4].copy_from_slice(&[-4.0, -4.0, 4.0, 4.0]);
         let (mut cache, mut old_mus) = (None, Vec::new());
-        for (index, value) in [(100, 0.0), (0, -4.0), (5, 4.0), (103, -0.0)] {
+        for (index, value) in [
+            (100, 0.0),
+            (0, -4.0),
+            (5, 4.0),
+            (103, -0.0),
+            (52, 2.0),
+            (6, -2.0),
+        ] {
             let positions: Vec<_> = (0..obs.len())
                 .map(|i| i + usize::from(i >= index))
                 .collect();
             obs.insert(index, value);
             let build = |sigmas, cache, previous| {
-                binned_sigmas(&obs, -5.0, 5.0, sigmas, cache, previous).unwrap();
+                binned_sigmas(&obs, -5.0, 5.0, sigmas, cache, previous, &mut Vec::new()).unwrap();
             };
             let (mut fresh, mut cached, mut no_cache) = (Vec::new(), Vec::new(), None);
             build(&mut fresh, &mut no_cache, None);
-            build(&mut cached, &mut cache, Some((&old_mus, &positions)));
+            let previous = (&old_mus[..], &positions[..], &[index][..]);
+            build(&mut cached, &mut cache, Some(previous));
             assert_eq!(cached, fresh, "insertion at {index}");
             assert!(cache.is_some());
             old_mus = obs.clone();

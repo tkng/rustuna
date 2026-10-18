@@ -17,7 +17,7 @@ impl<'a> NumericalDistributionBuilder for ScottNumericalDistributionBuilder<'a> 
         observations: impl Iterator<Item = f64>,
         parameters: &mut NumericalParameters,
         _bins: &mut Option<BinState>,
-        _previous: Option<(&[f64], &[usize])>,
+        _previous: Option<(&[f64], &[usize], &[usize])>,
     ) {
         // NOTE: Since the Optuna TPE bandwidth selection is too wide for this analysis, we use the Scott's rule:
         // David W. Scott. 1992. Multivariate Density Estimation: Theory, Practice, and Visualization. John Wiley & Sons.
