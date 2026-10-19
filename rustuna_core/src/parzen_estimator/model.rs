@@ -285,6 +285,13 @@ impl ParzenEstimator {
         self.mixuture_distribution.sample_ordered(rng, size)
     }
 
+    /// Samples into a caller-owned buffer so row allocations are reused.
+    #[doc(hidden)]
+    pub fn sample_ordered_into(&self, rng: &mut StdRng, size: usize, samples: &mut Vec<Vec<f64>>) {
+        self.mixuture_distribution
+            .sample_ordered_into(rng, size, samples)
+    }
+
     pub fn log_pdf(&self, x: &HashMap<String, f64>) -> f64 {
         self.mixuture_distribution.log_pdf(x)
     }
@@ -381,8 +388,7 @@ mod tests {
             1.0,
             None,
         );
-        let mut columns: Vec<Vec<f64>> =
-            vec![vec![f64::NAN; initial + 2 * rounds]; dists.len()];
+        let mut columns: Vec<Vec<f64>> = vec![vec![f64::NAN; initial + 2 * rounds]; dists.len()];
         for round in 0..rounds {
             mutate(&mut obs, &mut ids, &mut rng);
             let n = ids.len();

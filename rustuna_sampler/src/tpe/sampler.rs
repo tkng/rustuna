@@ -86,6 +86,7 @@ impl TpeBuilder {
             random_sampler: RandomSampler::seed_from_u64(seed_for_random_sampler),
             split_cache: RwLock::new(HashMap::new()),
             observations_cache: RwLock::new(ObservationsCache::default()),
+            samples_scratch: Mutex::new(Vec::new()),
         }
     }
 }
@@ -537,6 +538,8 @@ pub struct TpeSampler {
     /// Study columns are retained between trials. Storage is locked before
     /// this cache during updates; both are released before model construction.
     observations_cache: RwLock<ObservationsCache>,
+    /// Reusable candidate buffers for `sample_ordered_into`.
+    samples_scratch: Mutex<Vec<Vec<f64>>>,
 }
 impl Default for TpeSampler {
     fn default() -> Self {
@@ -662,21 +665,29 @@ impl TpeSampler {
 
         assert_eq!(good.parameter_names(), poor.parameter_names());
         let n_ei_candidates = 24;
-        let mut samples_good = {
+        let mut scratch = self.samples_scratch.lock().map_err(|e| {
+            Error::with_reason(
+                ErrorKind::SamplerError,
+                format!("Failed to acquire samples scratch: {e}"),
+            )
+        })?;
+        {
             let mut rng = self.rng.lock().map_err(|e| {
                 Error::with_reason(
                     ErrorKind::SamplerError,
                     format!("Failed to acquire RNG guard: {e}"),
                 )
             })?;
-            good.sample_ordered(&mut rng, n_ei_candidates)
-        };
-        let best_idx = good.best_candidate_index(&poor, &samples_good);
+            good.sample_ordered_into(&mut rng, n_ei_candidates, &mut scratch);
+        }
+        let best_idx = good.best_candidate_index(&poor, &scratch);
+        let best_sample = std::mem::take(&mut scratch[best_idx]);
+        drop(scratch);
         let result = good
             .parameter_names()
             .iter()
             .cloned()
-            .zip(samples_good.swap_remove(best_idx))
+            .zip(best_sample)
             .collect();
         let mut cache = self.observations_cache.write().map_err(|e| {
             Error::with_reason(

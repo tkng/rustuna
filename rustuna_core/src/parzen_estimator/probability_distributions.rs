@@ -1080,11 +1080,24 @@ impl MixtureOfProductDistribution {
     }
 
     pub fn sample_ordered(&self, rng: &mut StdRng, size: usize) -> Vec<Vec<f64>> {
-        let mut samples: Vec<Vec<f64>> = Vec::with_capacity(size);
+        let mut samples = Vec::new();
+        self.sample_ordered_into(rng, size, &mut samples);
+        samples
+    }
 
-        for _ in 0..size {
+    /// `sample_ordered` into a caller-owned buffer so inner row allocations
+    /// are reused across calls.
+    pub(crate) fn sample_ordered_into(
+        &self,
+        rng: &mut StdRng,
+        size: usize,
+        samples: &mut Vec<Vec<f64>>,
+    ) {
+        samples.iter_mut().for_each(Vec::clear);
+        samples.resize_with(size, Vec::new);
+
+        for sample in samples.iter_mut() {
             let k = self.alias.sample(rng); // Active kernel index
-            let mut sample = Vec::with_capacity(self.param_names.len());
             for (param, dist) in self.param_names.iter().zip(self.distributions.iter()) {
                 match dist {
                     Distributions::TruncNorm(d) => {
@@ -1170,10 +1183,7 @@ impl MixtureOfProductDistribution {
                     }
                 }
             }
-            samples.push(sample);
         }
-
-        samples
     }
 
     pub fn log_pdf(&self, x: &HashMap<String, f64>) -> f64 {
