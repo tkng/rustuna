@@ -1,3 +1,4 @@
+use super::scott::ScottNumericalDistributionBuilder;
 use super::truncnorm;
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -6,40 +7,189 @@ use std::collections::HashMap;
 
 use super::truncnorm::NEG_HALF_LOG_2PI;
 
-/// Numerical kernel parameters and the kernels whose density coefficients may need updating.
+/// Previous continuous-normal kernels, retained until the new coefficients are computed.
+/// Between parameters the buffers are always empty; `update_normal` swaps previous
+/// contents in where lookups are needed and clears the slots when done, so the
+/// buffers only ever carry spare capacity.
 #[derive(Default)]
-pub(crate) struct NumericalParameters {
+pub(crate) struct NormalBuffers {
     pub mus: Vec<f64>,
     pub sigmas: Vec<f64>,
-    pub low: f64,
-    pub high: f64,
-    pub step: Option<f64>,
-    pub log: bool,
-    // Nonempty only on bin reuse; flags new kernels and possibly changed widths.
-    pub updated: Vec<u64>,
+    pub log_consts: Vec<f64>,
 }
 
-/// Previous continuous-normal kernels, retained until the new coefficients are computed.
-#[derive(Default)]
-struct NormalBuffers {
-    mus: Vec<f64>,
-    sigmas: Vec<f64>,
-    log_consts: Vec<f64>,
+impl NormalBuffers {
+    fn clear(&mut self) {
+        self.mus.clear();
+        self.sigmas.clear();
+        self.log_consts.clear();
+    }
 }
 
-fn normal_log_constants(
-    parameters: &NumericalParameters,
-    previous: &NormalBuffers,
-    indices: &[Option<usize>],
-    constants: &mut Vec<f64>,
+/// Set-bit positions of `mask`, in ascending order.
+#[doc(hidden)]
+pub fn set_bits(mask: &[u64]) -> impl Iterator<Item = usize> + '_ {
+    mask.iter().enumerate().flat_map(|(word, &bits)| {
+        (0..64)
+            .filter(move |&b| bits >> b & 1 == 1)
+            .map(move |b| word * 64 + b)
+    })
+}
+
+/// Refills `dst` with `n` values: retained positions keep their `old` value
+/// remapped by `update`, added positions call `gather`.
+fn remap_or_gather<T: Copy + Default>(
+    dst: &mut Vec<T>,
+    n: usize,
+    update: &KernelUpdate,
+    old: &[T],
+    gather: impl Fn(usize) -> T,
 ) {
-    let (low, high) = if parameters.log {
-        (parameters.low.ln(), parameters.high.ln())
-    } else {
-        (parameters.low, parameters.high)
-    };
+    dst.resize(n, T::default());
+    for (k, slot) in dst.iter_mut().enumerate() {
+        *slot = update.old_index(k).map_or_else(|| gather(k), |o| old[o]);
+    }
+}
+
+/// Refills `dst` with `n` values under `update`: trusted updates reuse
+/// retained values via `old` (which receives them by swap), otherwise all
+/// positions are rebuilt from `gather`.
+fn gather_column<T: Copy + Default>(
+    dst: &mut Vec<T>,
+    n: usize,
+    update: &KernelUpdate,
+    trusted: bool,
+    old: &mut Vec<T>,
+    gather: impl Fn(usize) -> T,
+) {
+    match update {
+        // The buffer already holds the retained prefix; appended ids extend it.
+        KernelUpdate::Append { retained } if trusted && dst.len() > *retained => {
+            dst.truncate(*retained);
+            dst.extend(update.added_positions(n).map(&gather));
+        }
+        // Retained values move to their new positions; added ones are gathered.
+        KernelUpdate::Scatter { .. } if trusted && !dst.is_empty() => {
+            std::mem::swap(dst, old);
+            remap_or_gather(dst, n, update, old, gather);
+        }
+        _ => {
+            std::mem::swap(dst, old);
+            dst.clear();
+            dst.extend((0..n).map(gather));
+        }
+    }
+}
+
+/// How the new observation ids relate to a previous model's ids. `positions`
+/// maps each old observation to its new index (`usize::MAX` when removed) and
+/// `indices` is the reverse; `retained` is the length of the common prefix,
+/// which maps identically for pure appends.
+pub(crate) enum KernelUpdate {
+    Fresh,
+    Append {
+        retained: usize,
+    },
+    Scatter {
+        positions: Vec<usize>,
+        indices: Vec<Option<usize>>,
+    },
+}
+
+impl KernelUpdate {
+    /// Computes how `new_ids` relates to `old_ids` (both sorted ascending).
+    pub fn between(old_ids: &[u32], new_ids: &[u32]) -> Self {
+        if old_ids.is_empty() {
+            return Self::Fresh;
+        }
+        if new_ids.starts_with(old_ids) {
+            return Self::Append {
+                retained: old_ids.len(),
+            };
+        }
+        let mut indices = Vec::with_capacity(new_ids.len());
+        let mut old = 0;
+        for id in new_ids {
+            while old < old_ids.len() && old_ids[old] < *id {
+                old += 1;
+            }
+            indices.push((old_ids.get(old) == Some(id)).then_some(old));
+        }
+        let mut positions = vec![usize::MAX; old_ids.len()];
+        for (new, old_index) in indices.iter().enumerate() {
+            if let Some(old_index) = old_index {
+                positions[*old_index] = new;
+            }
+        }
+        Self::Scatter { positions, indices }
+    }
+
+    /// Old kernel index for new observation `k`, or `None` when `k` is added.
+    pub fn old_index(&self, k: usize) -> Option<usize> {
+        match self {
+            Self::Fresh => None,
+            Self::Append { retained } => (k < *retained).then_some(k),
+            Self::Scatter { indices, .. } => indices.get(k).copied().flatten(),
+        }
+    }
+
+    /// New positions not retained from the old kernels: `0..n` on a fresh
+    /// build, the appended tail for appends, or the listed additions.
+    pub fn added_positions(&self, n: usize) -> impl Iterator<Item = usize> + '_ {
+        // Positions at or beyond `start` never have an old index.
+        let start = match self {
+            Self::Append { retained } => *retained,
+            _ => 0,
+        };
+        (start..n).filter(|&k| self.old_index(k).is_none())
+    }
+
+    /// Number of observation kernels before this update.
+    pub fn old_len(&self) -> usize {
+        match self {
+            Self::Fresh => 0,
+            Self::Append { retained } => *retained,
+            Self::Scatter { positions, .. } => positions.len(),
+        }
+    }
+}
+
+/// Inputs shared by the kernel-table update of one parameter: the column
+/// values, which rows they occupy, and how the new rows map onto old kernels.
+struct NormalUpdate<'a> {
+    values: &'a [Option<f64>],
+    order: &'a [usize],
+    adj_low: f64,
+    adj_high: f64,
+    step: Option<f64>,
+    log: bool,
+    update: &'a KernelUpdate,
+    /// Scott's-rule widths when set; `None` selects nearest-neighbor bins.
+    scott: Option<&'a ScottNumericalDistributionBuilder<'a>>,
+    /// Whether retained observations are guaranteed to hold identical values.
+    trusted: bool,
+    bins: &'a mut Option<BinState>,
+    /// Kernel positions whose sigma may have changed.
+    updated: &'a mut Vec<u64>,
+    /// Previous kernel buffers, used for lookups then cleared for reuse.
+    old: &'a mut NormalBuffers,
+}
+
+/// Recomputes the kernel log-coefficients `NEG_HALF_LOG_2PI - ln(sigma) - ln_mass`.
+/// `updated` flags kernels whose sigma may have changed; `old` receives the
+/// previous coefficients by swap so unchanged ones are reused.
+fn update_log_consts(
+    log_consts: &mut Vec<f64>,
+    mus: &[f64],
+    sigmas: &[f64],
+    adj_low: f64,
+    adj_high: f64,
+    updated: &[u64],
+    update: &KernelUpdate,
+    old: &mut NormalBuffers,
+) {
     let compute = |mu: f64, sigma: f64| {
-        let ln_mass = truncnorm::log_diff_cdf((low - mu) / sigma, (high - mu) / sigma)
+        let ln_mass = truncnorm::log_diff_cdf((adj_low - mu) / sigma, (adj_high - mu) / sigma)
             .unwrap_or(f64::NEG_INFINITY);
         if ln_mass == f64::NEG_INFINITY {
             f64::NEG_INFINITY
@@ -47,56 +197,334 @@ fn normal_log_constants(
             NEG_HALF_LOG_2PI - sigma.ln() - ln_mass
         }
     };
-    constants.clear();
-    if !parameters.updated.is_empty() && !previous.mus.is_empty() {
-        // Bin reuse already verified retained means and the width floor. With finite bounds
-        // and positive finite widths these cached coefficients cannot be NaN.
-        let mut old_start = 0;
-        for (word, mut bits) in parameters.updated.iter().copied().enumerate() {
-            while bits != 0 {
-                let k = word * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                // All old observations are retained, and every insertion is flagged. Copy the
-                // unchanged span between flagged kernels without checking it kernel by kernel.
-                let len = k - constants.len();
-                constants.extend_from_slice(&previous.log_consts[old_start..old_start + len]);
-                constants.push(match indices[k] {
-                    Some(i) if previous.sigmas[i].to_bits() == parameters.sigmas[k].to_bits() => {
-                        previous.log_consts[i]
-                    }
-                    _ => compute(parameters.mus[k], parameters.sigmas[k]),
-                });
-                old_start += len + usize::from(indices[k].is_some());
+    if let KernelUpdate::Append { retained } = update {
+        // Appends keep the previous coefficients in place: recompute flagged
+        // retained positions, evaluate the appended tail, restore the prior.
+        // `updated` empty means flag information is unavailable, not verified.
+        if !updated.is_empty() && log_consts.len() > *retained {
+            let prior_const = log_consts[*retained];
+            log_consts.truncate(*retained);
+            for k in set_bits(updated).take_while(|&k| k < *retained) {
+                log_consts[k] = compute(mus[k], sigmas[k]);
+            }
+            log_consts.extend((*retained..mus.len() - 1).map(|k| compute(mus[k], sigmas[k])));
+            log_consts.push(prior_const);
+            return;
+        }
+    }
+    if old.log_consts.is_empty() {
+        std::mem::swap(log_consts, &mut old.log_consts);
+    }
+    log_consts.clear();
+    // `updated` marks kernels whose sigma may have changed; empty means no
+    // flag information is available, so every position must be verified.
+    let may_have_changed = |k: usize| {
+        updated.is_empty() || updated.get(k / 64).is_some_and(|w| w >> (k % 64) & 1 == 1)
+    };
+    for k in 0..mus.len() {
+        // The prior kernel always occupies the trailing slot.
+        let old_index = update
+            .old_index(k)
+            .or((k + 1 == mus.len()).then_some(update.old_len()));
+        let reused = old_index
+            .filter(|&i| {
+                !may_have_changed(k)
+                    || ((old.mus.is_empty()
+                        || old.mus.get(i).map(|m| m.to_bits()) == Some(mus[k].to_bits()))
+                        && old.sigmas.get(i).map(|s| s.to_bits()) == Some(sigmas[k].to_bits()))
+            })
+            .and_then(|i| old.log_consts.get(i).copied())
+            .filter(|c| !c.is_nan());
+        log_consts.push(reused.unwrap_or_else(|| compute(mus[k], sigmas[k])));
+    }
+}
+
+/// One search-space parameter's values in storage row order.
+/// Entries at `order` positions must be `Some`; other entries are never read.
+#[doc(hidden)]
+pub struct ObservationColumn<'a> {
+    pub name: &'a str,
+    pub distribution: &'a crate::distribution::Distribution,
+    pub values: &'a [Option<f64>],
+}
+
+/// Fixed-width bins over `(low, high]` tracking each bin's min/max extreme and
+/// the observation index holding it, so bandwidth updates only rescan changed bins.
+#[derive(Default, Clone)]
+pub(crate) struct BinState {
+    pub low: f64,
+    pub high: f64,
+    /// (min, min_idx, max, max_idx) per bin; `min > max` marks the bin empty.
+    pub bins: Vec<(f64, usize, f64, usize)>,
+}
+
+/// Updates `mus`, `sigmas`, and `log_consts` in place from `ctx`. Retained
+/// kernels keep their storage: buffers already holding the previous values are
+/// extended in place, otherwise they swap contents with `ctx.old` for lookups.
+fn update_normal(
+    mus: &mut Vec<f64>,
+    sigmas: &mut Vec<f64>,
+    log_consts: &mut Vec<f64>,
+    ctx: &mut NormalUpdate,
+) {
+    let (values, order, log) = (ctx.values, ctx.order, ctx.log);
+    let n = order.len();
+    let gather = |i: usize| -> f64 {
+        let v = values[order[i]].expect("observation column lacks a selected value");
+        if log {
+            v.ln()
+        } else {
+            v
+        }
+    };
+    gather_column(mus, n, ctx.update, ctx.trusted, &mut ctx.old.mus, gather);
+    mus.push((ctx.adj_low + ctx.adj_high) / 2.0); // Add prior
+    update_sigmas(&mus[..n], sigmas, ctx);
+    if ctx.step.is_none() {
+        update_log_consts(
+            log_consts,
+            mus,
+            sigmas,
+            ctx.adj_low,
+            ctx.adj_high,
+            ctx.updated,
+            ctx.update,
+            ctx.old,
+        );
+    }
+    ctx.old.clear();
+}
+
+/// Fills `sigmas` with `obs.len() + 1` widths (observations then the prior):
+/// Scott's rule or nearest-neighbor bins, else a sorted scan.
+fn update_sigmas(obs: &[f64], sigmas: &mut Vec<f64>, ctx: &mut NormalUpdate) {
+    let n = obs.len();
+    if n == 0 {
+        *ctx.bins = None;
+        std::mem::swap(sigmas, &mut ctx.old.sigmas);
+        sigmas.push(ctx.adj_high - ctx.adj_low);
+    } else if let Some(scott) = ctx.scott {
+        std::mem::swap(sigmas, &mut ctx.old.sigmas);
+        ctx.updated.clear();
+        *ctx.bins = None;
+        scott.sigmas(obs, sigmas);
+        sigmas.push(ctx.adj_high - ctx.adj_low + 1.0);
+    } else if binned_sigmas(
+        obs,
+        ctx.adj_low,
+        ctx.adj_high,
+        sigmas,
+        &mut ctx.old.sigmas,
+        ctx.bins,
+        ctx.update,
+        (!ctx.trusted).then_some(&ctx.old.mus[..]),
+        ctx.updated,
+    ) {
+        sigmas.push(ctx.adj_high - ctx.adj_low);
+    } else {
+        sorted_scan_sigmas(obs, sigmas, ctx);
+    }
+}
+
+/// Fallback kernel widths when binning cannot apply: the larger gap to the
+/// sorted neighbors, clamped to the search-space scale.
+fn sorted_scan_sigmas(obs: &[f64], sigmas: &mut Vec<f64>, ctx: &mut NormalUpdate) {
+    let n = obs.len();
+    if ctx.old.sigmas.is_empty() {
+        std::mem::swap(sigmas, &mut ctx.old.sigmas);
+    }
+    sigmas.clear();
+    let mut sorted: Vec<(usize, f64)> = (0..n).map(|i| (i, obs[i])).collect();
+    sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+    // Each kernel's width is the larger gap to its sorted neighbors.
+    sigmas.resize(n, 0.0);
+    if n == 1 {
+        let v = sorted[0].1;
+        sigmas[sorted[0].0] = (v - ctx.adj_low).max(ctx.adj_high - v);
+    } else {
+        for w in sorted.windows(2) {
+            let gap = w[1].1 - w[0].1;
+            sigmas[w[0].0] = sigmas[w[0].0].max(gap);
+            sigmas[w[1].0] = sigmas[w[1].0].max(gap);
+        }
+    }
+    sigmas.push(ctx.adj_high - ctx.adj_low);
+    let maxsigma = ctx.adj_high - ctx.adj_low;
+    let minsigma = maxsigma / (100.0_f64.min(n as f64 + 2.0));
+    for s in sigmas.iter_mut() {
+        *s = s.clamp(minsigma, maxsigma);
+    }
+}
+
+/// Computes kernel widths from fixed-width bins. Only bin extremes can be a
+/// kernel's farthest neighbor, so per-bin (min,max) pairs give every bandwidth.
+/// When `update` allows reuse, `positions` remap bin indices and only `added`
+/// observations are inserted; `sigmas` keeps its retained prefix and flagged
+/// positions drop to the floor before the extreme sweeps. Returns `false` when
+/// the caller must fall back to the sorted-scan formula.
+pub(crate) fn binned_sigmas(
+    obs: &[f64],
+    low: f64,
+    high: f64,
+    sigmas: &mut Vec<f64>,
+    old_sigmas: &mut Vec<f64>,
+    cache: &mut Option<BinState>,
+    update: &KernelUpdate,
+    previous_mus: Option<&[f64]>,
+    updated: &mut Vec<u64>,
+) -> bool {
+    updated.clear();
+    if obs.len() < 2 {
+        if old_sigmas.is_empty() && !sigmas.is_empty() {
+            std::mem::swap(sigmas, old_sigmas);
+        }
+        *cache = None;
+        return false;
+    }
+
+    let n_bins = 100.min(obs.len() + 2);
+    let minsigma = (high - low) / n_bins as f64;
+
+    let mut state = cache.take().unwrap_or_default();
+    let reuse = reusable_bins(&mut state, n_bins, low, high, obs, update, previous_mus);
+    let empty = (f64::INFINITY, 0_usize, f64::NEG_INFINITY, 0_usize);
+    state.bins.resize(n_bins, empty);
+    if reuse {
+        updated.resize(obs.len().div_ceil(64), 0);
+    } else {
+        state.bins.fill(empty);
+    }
+    match update {
+        // Retained kernels keep their sigmas; flagged ones reset to the floor.
+        KernelUpdate::Append { retained } if reuse && sigmas.len() > *retained => {
+            sigmas.truncate(*retained);
+        }
+        _ => {
+            std::mem::swap(sigmas, old_sigmas);
+            sigmas.clear();
+        }
+    }
+
+    // Insert the observations new to this update (all of them on a rebuild),
+    // updating bins and flagging kernels whose widths may change.
+    let mut changed_bins = 0_u128;
+    let mut insert = |i: usize| -> bool {
+        let v = obs[i];
+        if reuse {
+            updated[i / 64] |= 1 << (i % 64);
+        }
+        if !(low..=high).contains(&v) {
+            return false;
+        }
+        let index = (((v - low) / minsigma) as u32 as usize).min(n_bins - 1);
+        let bin = &mut state.bins[index];
+        let changes_min = v < bin.0 || (v == bin.0 && i < bin.1);
+        let changes_max = v > bin.2 || (v == bin.2 && i >= bin.3);
+        if reuse && (changes_min || changes_max) {
+            changed_bins |= 1 << index;
+            for old in [bin.1, bin.3] {
+                updated[old / 64] |= 1 << (old % 64);
             }
         }
-        constants.extend_from_slice(&previous.log_consts[old_start..]); // Includes prior.
-        return;
+        if changes_min {
+            (bin.0, bin.1) = (v, i);
+        }
+        if changes_max {
+            (bin.2, bin.3) = (v, i);
+        }
+        true
+    };
+    let inserted = if reuse {
+        update.added_positions(obs.len()).all(|i| insert(i))
+    } else {
+        (0..obs.len()).all(|i| insert(i))
+    };
+    if !inserted {
+        updated.clear();
+        return false;
     }
-    constants.extend(
-        parameters
-            .mus
-            .iter()
-            .zip(&parameters.sigmas)
-            .enumerate()
-            .map(|(k, (&mu, &sigma))| {
-                let old_index = if k + 1 == parameters.mus.len() {
-                    previous.mus.len().checked_sub(1) // Prior kernel.
-                } else {
-                    indices.get(k).copied().flatten()
-                };
-                if let Some(i) = old_index {
-                    if previous.mus.get(i).map(|m| m.to_bits()) == Some(mu.to_bits())
-                        && previous.sigmas.get(i).map(|s| s.to_bits()) == Some(sigma.to_bits())
-                    {
-                        if let Some(&constant) = previous.log_consts.get(i).filter(|c| !c.is_nan())
-                        {
-                            return constant;
-                        }
-                    }
-                }
-                compute(mu, sigma)
-            }),
-    );
+
+    // Only changed bins and their nearest non-empty neighbors can change widths.
+    while changed_bins != 0 {
+        let index = changed_bins.trailing_zeros() as usize;
+        changed_bins &= changed_bins - 1;
+        let neighbors = [
+            state.bins[..index].iter().rfind(|b| b.0 <= b.2),
+            Some(&state.bins[index]),
+            state.bins[index + 1..].iter().find(|b| b.0 <= b.2),
+        ];
+        for bin in neighbors.into_iter().flatten() {
+            for i in [bin.1, bin.3] {
+                updated[i / 64] |= 1 << (i % 64);
+            }
+        }
+    }
+    sigmas.resize(obs.len(), minsigma);
+    // Flagged retained kernels drop back to the width floor.
+    for i in set_bits(updated) {
+        sigmas[i] = minsigma;
+    }
+    let (mut prev_max, mut next_min) = (f64::NAN, f64::NAN);
+    for bin in state.bins.iter().filter(|b| b.0 <= b.2) {
+        sigmas[bin.1] = sigmas[bin.1].max(bin.0 - prev_max);
+        prev_max = bin.2;
+    }
+    for bin in state.bins.iter().rev().filter(|b| b.0 <= b.2) {
+        sigmas[bin.3] = sigmas[bin.3].max(next_min - bin.2);
+        next_min = bin.0;
+    }
+    if n_bins == 100 && minsigma.is_finite() && minsigma > 0.0 {
+        (state.low, state.high) = (low, high);
+        *cache = Some(state);
+    }
+    true
+}
+
+/// Whether cached `state` applies to this update, remapping scatter bin
+/// indices on success: same bounds and bins, retained values verified.
+fn reusable_bins(
+    state: &mut BinState,
+    n_bins: usize,
+    low: f64,
+    high: f64,
+    obs: &[f64],
+    update: &KernelUpdate,
+    previous_mus: Option<&[f64]>,
+) -> bool {
+    if matches!(update, KernelUpdate::Fresh)
+        || !same_bounds(state.low, state.high, low, high)
+        || state.bins.len() != n_bins
+    {
+        return false;
+    }
+    if let Some(previous_mus) = previous_mus {
+        // Untrusted callers may change retained values; a changed kernel must
+        // be rebuilt rather than remapped.
+        let unchanged = (0..obs.len()).all(|k| {
+            update
+                .old_index(k)
+                .map_or(true, |o| previous_mus.get(o) == Some(&obs[k]))
+        });
+        if !unchanged {
+            return false;
+        }
+    }
+    match update {
+        KernelUpdate::Scatter { positions, .. } => {
+            // A removed extreme can hide another retained observation in its
+            // bin; without the next-in-bin order the bins must be rebuilt.
+            state
+                .bins
+                .iter_mut()
+                .filter(|bin| bin.0 <= bin.2)
+                .all(|bin| {
+                    let (lo, hi) = (positions[bin.1], positions[bin.3]);
+                    (bin.1, bin.3) = (lo, hi);
+                    lo != usize::MAX && hi != usize::MAX
+                })
+        }
+        _ => true,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +728,12 @@ impl DiscreteTruncLogNormDistributions {
     }
 }
 
+fn categorical_probabilities(n_observed: usize, cardinality: usize) -> (f64, f64) {
+    let prior_mass = 1.0 / (n_observed + 1) as f64;
+    let denominator = 1.0 + cardinality as f64 * prior_mass;
+    ((1.0 + prior_mass) / denominator, prior_mass / denominator)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CategoricalDistributions {
     // Each observation contributes a uniform mass plus a spike at its category.
@@ -311,6 +745,7 @@ pub(crate) struct CategoricalDistributions {
 }
 
 impl CategoricalDistributions {
+    #[cfg(test)]
     pub(crate) fn new(observations: impl IntoIterator<Item = f64>, cardinality: usize) -> Self {
         assert!(cardinality > 0, "Categorical cardinality must be positive");
         let observations = observations.into_iter();
@@ -321,16 +756,45 @@ impl CategoricalDistributions {
             assert!(category < cardinality, "Observed category is out of range");
             observed_categories.push(category);
         }
-        let prior_mass = 1.0 / (observed_categories.len() + 1) as f64;
-        let denominator = 1.0 + cardinality as f64 * prior_mass;
-        let matching = (1.0 + prior_mass) / denominator;
-        let other = prior_mass / denominator;
+        Self::with_categories(observed_categories, cardinality)
+    }
+
+    /// Builds from an already materialized category list, e.g. kept and appended
+    /// categories on incremental updates.
+    pub(crate) fn with_categories(observed_categories: Vec<usize>, cardinality: usize) -> Self {
+        assert!(cardinality > 0, "Categorical cardinality must be positive");
+        let (matching, other) = categorical_probabilities(observed_categories.len(), cardinality);
         Self {
             observed_categories,
             cardinality,
             matching,
             other,
         }
+    }
+
+    /// Updates `observed_categories` in place from the column at `order` rows.
+    /// Trusted updates read only the positions `update` marks as added; retained
+    /// categories are kept or moved without re-reading the column.
+    pub(crate) fn update_categories(
+        &mut self,
+        values: &[Option<f64>],
+        order: &[usize],
+        update: &KernelUpdate,
+        trusted: bool,
+    ) {
+        let gather =
+            |i: usize| values[order[i]].expect("categorical lacks a selected value") as usize;
+        let mut old = Vec::new();
+        gather_column(
+            &mut self.observed_categories,
+            order.len(),
+            update,
+            trusted,
+            &mut old,
+            gather,
+        );
+        (self.matching, self.other) =
+            categorical_probabilities(self.observed_categories.len(), self.cardinality);
     }
 
     fn probability(&self, kernel: usize, category: usize) -> f64 {
@@ -365,48 +829,92 @@ pub(crate) enum Distributions {
     Categorical(CategoricalDistributions),
 }
 
+/// `low`/`high` bounds compare by bits so the same search space reuses kernels.
+fn same_bounds(old_low: f64, old_high: f64, low: f64, high: f64) -> bool {
+    old_low.to_bits() == low.to_bits() && old_high.to_bits() == high.to_bits()
+}
+
 impl Distributions {
-    /// Builds the distribution and recycles old allocations into the shared workspace.
-    /// `previous` carries the same parameter's earlier distribution together with the map from
-    /// each new observation to its old kernel index, so unchanged normalizers are kept.
-    pub(crate) fn from_numerical(
-        parameters: &mut NumericalParameters,
-        previous: Option<(Self, &[Option<usize>])>,
-        constants: &mut Vec<f64>,
-    ) -> Self {
-        let (old, indices) = previous
-            .and_then(|(distribution, indices)| {
-                let (old_low, old_high, mus, sigmas, log_consts) =
-                    match (distribution, parameters.log) {
-                        (Self::TruncNorm(d), false) => {
-                            (d.low, d.high, d.mus, d.sigmas, d.log_consts)
-                        }
-                        (Self::TruncLogNorm(d), true) => {
-                            (d.low, d.high, d.mus, d.sigmas, d.log_consts)
-                        }
-                        _ => return None,
-                    };
-                (parameters.step.is_none()
-                    && old_low.to_bits() == parameters.low.to_bits()
-                    && old_high.to_bits() == parameters.high.to_bits())
-                .then_some((
-                    NormalBuffers {
-                        mus,
-                        sigmas,
-                        log_consts,
-                    },
-                    indices,
-                ))
-            })
-            .unwrap_or_default();
-        if parameters.step.is_none() {
-            normal_log_constants(parameters, &old, indices, constants);
+    /// Updates this parameter's kernels in place from `column` at `order` rows.
+    /// Kernel arrays keep storage and unchanged coefficients; `update` tells which
+    /// observation positions are retained, removed, or newly added. `spare`
+    /// provides reusable buffers shared across the model's parameters.
+    pub(crate) fn update(
+        &mut self,
+        column: &ObservationColumn,
+        order: &[usize],
+        update: &KernelUpdate,
+        bins: &mut Option<BinState>,
+        scott: Option<&ScottNumericalDistributionBuilder>,
+        trusted: bool,
+        updated: &mut Vec<u64>,
+        spare: &mut NormalBuffers,
+    ) {
+        let (low, high, step, log) = match column.distribution {
+            crate::distribution::Distribution::Float {
+                low,
+                high,
+                step,
+                log,
+            } => (*low, *high, *step, *log),
+            crate::distribution::Distribution::Int {
+                low,
+                high,
+                step,
+                log,
+            } => (*low as f64, *high as f64, Some(*step as f64), *log),
+            crate::distribution::Distribution::Categorical { cardinality } => {
+                match self {
+                    Self::Categorical(d) if d.cardinality == *cardinality => {
+                        d.update_categories(column.values, order, update, trusted);
+                    }
+                    _ => {
+                        let mut d =
+                            CategoricalDistributions::with_categories(Vec::new(), *cardinality);
+                        d.update_categories(column.values, order, update, false);
+                        *self = Self::Categorical(d);
+                    }
+                }
+                return;
+            }
+        };
+        let (mut adj_low, mut adj_high) = match step {
+            Some(s) => (low - s / 2.0, high + s / 2.0),
+            None => (low, high),
+        };
+        if log {
+            adj_low = adj_low.ln();
+            adj_high = adj_high.ln();
         }
-        let mus = std::mem::replace(&mut parameters.mus, old.mus);
-        let sigmas = std::mem::replace(&mut parameters.sigmas, old.sigmas);
-        let log_consts = std::mem::replace(constants, old.log_consts);
-        let (low, high) = (parameters.low, parameters.high);
-        match (parameters.step, parameters.log) {
+        let mut ctx = NormalUpdate {
+            values: column.values,
+            order,
+            adj_low,
+            adj_high,
+            step,
+            log,
+            update,
+            scott,
+            trusted,
+            bins,
+            updated,
+            old: spare,
+        };
+        if let Some((mus, sigmas, log_consts)) = self.kernels_mut(step, log, low, high) {
+            update_normal(mus, sigmas, log_consts, &mut ctx);
+            return;
+        }
+        // Shape or bounds changed: rebuild, reusing a matching discrete
+        // variant's buffers for capacity.
+        let (mut mus, mut sigmas) = self
+            .take_matching_buffers(step, log, low, high)
+            .unwrap_or_else(|| {
+                *ctx.bins = None;
+                (Vec::new(), Vec::new())
+            });
+        let mut log_consts = Vec::new();
+        update_normal(&mut mus, &mut sigmas, &mut log_consts, &mut ctx);
+        *self = match (step, log) {
             (None, false) => Self::TruncNorm(TruncNormDistributions {
                 mus,
                 sigmas,
@@ -427,7 +935,74 @@ impl Distributions {
             (Some(step), true) => Self::DiscreteTruncLogNorm(
                 DiscreteTruncLogNormDistributions::new(mus, sigmas, low, high, step),
             ),
+        };
+    }
+
+    /// Kernel buffers movable into a rebuild: only a discrete variant with a
+    /// matching shape (`step`, `log`) and identical bounds.
+    fn take_matching_buffers(
+        &mut self,
+        step: Option<f64>,
+        log: bool,
+        low: f64,
+        high: f64,
+    ) -> Option<(Vec<f64>, Vec<f64>)> {
+        match (&mut *self, step, log) {
+            (Self::DiscreteTruncNorm(d), Some(s), false)
+                if d.step == s && same_bounds(d.low, d.high, low, high) =>
+            {
+                Some((std::mem::take(&mut d.mus), std::mem::take(&mut d.sigmas)))
+            }
+            (Self::DiscreteTruncLogNorm(d), Some(s), true)
+                if d.step == s && same_bounds(d.low, d.high, low, high) =>
+            {
+                Some((std::mem::take(&mut d.mus), std::mem::take(&mut d.sigmas)))
+            }
+            _ => None,
         }
+    }
+
+    /// Kernel buffers reusable in place: only a continuous variant with a
+    /// matching shape (no `step`, matching `log`) and identical bounds.
+    fn kernels_mut(
+        &mut self,
+        step: Option<f64>,
+        log: bool,
+        low: f64,
+        high: f64,
+    ) -> Option<(&mut Vec<f64>, &mut Vec<f64>, &mut Vec<f64>)> {
+        match (&mut *self, step, log) {
+            (Self::TruncNorm(d), None, false) if same_bounds(d.low, d.high, low, high) => {
+                Some((&mut d.mus, &mut d.sigmas, &mut d.log_consts))
+            }
+            (Self::TruncLogNorm(d), None, true) if same_bounds(d.low, d.high, low, high) => {
+                Some((&mut d.mus, &mut d.sigmas, &mut d.log_consts))
+            }
+            _ => None,
+        }
+    }
+
+    /// Builds this parameter's distribution from `column` at `order` rows,
+    /// reading every selected value. `spare` provides reusable write buffers
+    /// shared across the model's parameters.
+    pub(crate) fn new_from_column(
+        column: &ObservationColumn,
+        order: &[usize],
+        update: &KernelUpdate,
+        bins: &mut Option<BinState>,
+        scott: Option<&ScottNumericalDistributionBuilder>,
+        updated: &mut Vec<u64>,
+        spare: &mut NormalBuffers,
+    ) -> Self {
+        let mut d = Self::TruncNorm(TruncNormDistributions {
+            mus: Vec::new(),
+            sigmas: Vec::new(),
+            low: f64::NAN,
+            high: f64::NAN,
+            log_consts: Vec::new(),
+        });
+        d.update(column, order, update, bins, scott, false, updated, spare);
+        d
     }
 
     pub(crate) fn n_kernels(&self) -> usize {
@@ -453,31 +1028,28 @@ pub(crate) struct MixtureOfProductDistribution {
 
 impl MixtureOfProductDistribution {
     pub fn new(entries: Vec<(String, Distributions)>, weights: Vec<f64>) -> Self {
-        let sum_w = weights.iter().sum::<f64>();
-        let log_sum_weights = if sum_w > 0.0 {
-            sum_w.ln()
-        } else {
-            0.0_f64.ln()
-        };
-        let log_weights = weights
-            .iter()
-            .map(|&w| if w > 0.0 { w.ln() } else { f64::NEG_INFINITY })
-            .collect::<Vec<_>>();
-
-        let n_kernels = weights.len();
-        let alias =
-            WeightedAliasIndex::new(weights).expect("weights must be non-empty and non-negative");
-
         let (param_names, distributions) = entries.into_iter().unzip();
-
-        MixtureOfProductDistribution {
+        let mut mixture = MixtureOfProductDistribution {
             param_names,
             distributions,
-            log_weights,
-            log_sum_weights,
-            alias,
-            n_kernels,
-        }
+            log_weights: Vec::new(),
+            log_sum_weights: 0.0,
+            alias: WeightedAliasIndex::new(vec![1.0])
+                .expect("unit weight is non-empty and non-negative"),
+            n_kernels: 0,
+        };
+        mixture.set_weights(weights);
+        mixture
+    }
+
+    /// Recomputes the sampling weights over the kernels: normalized ln weights,
+    /// their log-sum, and the alias table. `weights` includes the prior's.
+    pub(crate) fn set_weights(&mut self, weights: Vec<f64>) {
+        self.log_sum_weights = weights.iter().sum::<f64>().max(0.0).ln();
+        self.log_weights = weights.iter().map(|&w| w.max(0.0).ln()).collect();
+        self.n_kernels = weights.len();
+        self.alias =
+            WeightedAliasIndex::new(weights).expect("weights must be non-empty and non-negative");
     }
 
     pub fn sample(&self, rng: &mut StdRng, size: usize) -> Vec<HashMap<String, f64>> {
@@ -719,48 +1291,47 @@ mod tests {
 
     #[test]
     fn unchanged_normalizers_are_reused_after_removing_an_observation() {
-        let previous = NormalBuffers {
+        // Two old observations [0.2, 0.4] and a prior; the scatter keeps only
+        // the second, so both retained and prior coefficients are reused.
+        let mut old = NormalBuffers {
             mus: vec![0.2, 0.4, 0.5],
             sigmas: vec![0.3; 3],
             log_consts: vec![10.0, 20.0, 30.0], // Markers distinguish reuse from recomputation.
         };
-        let parameters = NumericalParameters {
-            mus: vec![0.4, 0.5],
-            sigmas: vec![0.3; 2],
-            low: 0.0,
-            high: 1.0,
-            ..Default::default()
+        let update = KernelUpdate::Scatter {
+            positions: vec![usize::MAX, 0],
+            indices: vec![Some(1)],
         };
         let mut constants = Vec::new();
-        normal_log_constants(&parameters, &previous, &[Some(1)], &mut constants);
+        update_log_consts(
+            &mut constants,
+            &[0.4, 0.5],
+            &[0.3, 0.3],
+            0.0,
+            1.0,
+            &[],
+            &update,
+            &mut old,
+        );
         assert_eq!(constants, [20.0, 30.0]); // Retained observation and prior.
     }
 
     #[test]
     fn test_mixture_of_product_distribution() {
-        let truncnorm_dist = Distributions::from_numerical(
-            &mut NumericalParameters {
-                mus: vec![-0.5, 0.0], // mus[-1] is prior
-                sigmas: vec![2.0, 1.0],
-                low: -1.0,
-                high: 1.0,
-                ..Default::default()
-            },
-            None,
-            &mut Vec::new(),
-        );
-        let trunclognorm_dist = Distributions::from_numerical(
-            &mut NumericalParameters {
-                mus: vec![2.0, 3.0],
-                sigmas: vec![2.0, 1.0],
-                low: 1.0,
-                high: 5.0,
-                log: true,
-                ..Default::default()
-            },
-            None,
-            &mut Vec::new(),
-        );
+        let truncnorm_dist = Distributions::TruncNorm(TruncNormDistributions {
+            mus: vec![-0.5, 0.0], // mus[-1] is prior
+            sigmas: vec![2.0, 1.0],
+            low: -1.0,
+            high: 1.0,
+            log_consts: vec![0.0, 0.0],
+        });
+        let trunclognorm_dist = Distributions::TruncLogNorm(TruncLogNormDistributions {
+            mus: vec![2.0, 3.0],
+            sigmas: vec![2.0, 1.0],
+            low: 1.0,
+            high: 5.0,
+            log_consts: vec![0.0, 0.0],
+        });
         let discrete_truncnorm_dist = DiscreteTruncNormDistributions::new(
             vec![-0.5, 0.0], // ditto
             vec![1.0, 1.0],  // ditto

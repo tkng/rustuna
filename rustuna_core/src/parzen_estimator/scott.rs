@@ -1,6 +1,3 @@
-use crate::parzen_estimator::model::{BinState, NumericalDistributionBuilder};
-use crate::parzen_estimator::probability_distributions::NumericalParameters;
-
 pub(crate) struct ScottNumericalDistributionBuilder<'a> {
     weights: &'a [f64],
 }
@@ -9,26 +6,12 @@ impl<'a> ScottNumericalDistributionBuilder<'a> {
     pub(crate) fn new(weights: &'a [f64]) -> Self {
         Self { weights }
     }
-}
 
-impl<'a> NumericalDistributionBuilder for ScottNumericalDistributionBuilder<'a> {
-    fn calculate_parameters(
-        &self,
-        observations: impl Iterator<Item = f64>,
-        parameters: &mut NumericalParameters,
-        _bins: &mut Option<BinState>,
-        _previous: Option<(&[f64], &[usize], &[usize])>,
-    ) {
-        // NOTE: Since the Optuna TPE bandwidth selection is too wide for this analysis, we use the Scott's rule:
-        // David W. Scott. 1992. Multivariate Density Estimation: Theory, Practice, and Visualization. John Wiley & Sons.
-        let NumericalParameters {
-            mus,
-            sigmas,
-            low,
-            high,
-            log,
-            ..
-        } = parameters;
+    /// Computes the shared Scott's-rule kernel width into `sigmas` for the
+    /// already log-transformed `observations`; the caller appends the prior width.
+    // NOTE: Since the Optuna TPE bandwidth selection is too wide for this analysis, we use the Scott's rule:
+    // David W. Scott. 1992. Multivariate Density Estimation: Theory, Practice, and Visualization. John Wiley & Sons.
+    pub(crate) fn sigmas(&self, observations: &[f64], sigmas: &mut Vec<f64>) {
         let weights_cum = self
             .weights
             .iter()
@@ -38,15 +21,6 @@ impl<'a> NumericalDistributionBuilder for ScottNumericalDistributionBuilder<'a> 
             })
             .collect::<Vec<_>>();
         let weights_sum = weights_cum.last().cloned().unwrap_or(1.0);
-        mus.clear();
-        if *log {
-            mus.extend(observations.map(|v| v.ln()));
-            *low = low.ln();
-            *high = high.ln();
-        } else {
-            mus.extend(observations);
-        }
-        let observations = mus.as_slice();
         let n_observations = observations.len();
 
         let mean_est = observations
@@ -72,12 +46,10 @@ impl<'a> NumericalDistributionBuilder for ScottNumericalDistributionBuilder<'a> 
         let sigma_est = 1.059 * sigma_est.min(iqr / 1.34) * weights_sum.powf(-0.2);
         // To avoid numerical errors. 0.5/1.64 means 1.64sigma (=90%) will fit in the target grid.
         let sigma_min = 0.5 / 1.64;
-        mus.push((*low + *high) / 2.0);
         sigmas.clear();
         sigmas.extend(std::iter::repeat_n(
             sigma_est.max(sigma_min),
             n_observations,
         ));
-        sigmas.push(*high - *low + 1.0);
     }
 }

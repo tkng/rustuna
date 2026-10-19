@@ -281,10 +281,78 @@ struct TpeObservationSet {
     values: Vec<f64>,
     n_objectives: usize,
     /// Parameter columns keyed by name, one slot per row; `None` where the
-    /// trial did not observe that parameter.
-    param_columns: HashMap<String, Vec<Option<f64>>>,
+    /// trial did not observe that parameter. `present` mirrors the `Some`
+    /// positions as a bitmask so row selection can use word-level `AND`.
+    param_columns: HashMap<String, ParamColumnStore>,
     /// Constraint feasibility and total violation of row `i`.
     feasibles_violations: Vec<(bool, f64)>,
+}
+
+/// One parameter column with its presence bitmask.
+#[derive(Clone, Debug, PartialEq)]
+struct ParamColumnStore {
+    values: Vec<Option<f64>>,
+    /// Bit `i` set iff `values[i].is_some()`.
+    present: Vec<u64>,
+}
+
+fn bit_get(mask: &[u64], i: usize) -> bool {
+    mask[i / 64] & (1 << (i % 64)) != 0
+}
+
+fn bit_set(mask: &mut Vec<u64>, i: usize, value: bool) {
+    let word = i / 64;
+    if mask.len() <= word {
+        mask.resize(word + 1, 0);
+    }
+    if value {
+        mask[word] |= 1 << (i % 64);
+    } else {
+        mask[word] &= !(1 << (i % 64));
+    }
+}
+
+/// Moves the bits at `pos` and above by one position: `up` shifts toward
+/// higher indices (leaving a cleared bit at `pos`), otherwise toward lower ones.
+fn bit_shift(mask: &mut Vec<u64>, pos: usize, up: bool) {
+    let (word, bit) = (pos / 64, pos % 64);
+    let lo_mask = (1u64 << bit) - 1;
+    if up {
+        if mask.len() <= word {
+            mask.resize(word + 1, 0);
+        }
+        let mut carry = mask[word] >> 63;
+        mask[word] = (mask[word] & lo_mask) | ((mask[word] & !lo_mask) << 1);
+        for w in mask.iter_mut().skip(word + 1) {
+            let next = *w >> 63;
+            *w = (*w << 1) | carry;
+            carry = next;
+        }
+        if carry != 0 {
+            mask.push(carry);
+        }
+    } else {
+        if mask.len() <= word {
+            return;
+        }
+        mask[word] = (mask[word] & lo_mask) | ((mask[word] >> (bit + 1)) << bit);
+        for w in word + 1..mask.len() {
+            mask[w - 1] |= mask[w] << 63;
+            mask[w] >>= 1;
+        }
+        while mask.last() == Some(&0) {
+            mask.pop();
+        }
+    }
+}
+
+fn bit_insert(mask: &mut Vec<u64>, pos: usize, value: bool) {
+    bit_shift(mask, pos, true);
+    bit_set(mask, pos, value);
+}
+
+fn bit_remove(mask: &mut Vec<u64>, pos: usize) {
+    bit_shift(mask, pos, false);
 }
 
 /// Borrowed projection of a [`TpeObservationSet`] onto one search space.
@@ -302,12 +370,7 @@ struct TpeObservationColumn<'a> {
     name: &'a str,
     distribution: &'a Distribution,
     values: Option<&'a [Option<f64>]>,
-}
-
-impl TpeObservationColumn<'_> {
-    fn at(&self, row: usize) -> Option<f64> {
-        self.values.and_then(|values| values[row])
-    }
+    present: Option<&'a [u64]>,
 }
 
 impl TpeObservationSet {
@@ -341,16 +404,19 @@ impl TpeObservationSet {
             values.iter().copied(),
         );
         for column in self.param_columns.values_mut() {
-            column.insert(row, None);
+            column.values.insert(row, None);
+            bit_insert(&mut column.present, row, false);
         }
         for (name, &value) in &trial.internal_params {
-            if let Some(column) = self.param_columns.get_mut(name) {
-                column[row] = Some(value);
-            } else {
-                let mut column = vec![None; self.trial_numbers.len()];
-                column[row] = Some(value);
-                self.param_columns.insert(name.clone(), column);
-            }
+            let column =
+                self.param_columns
+                    .entry(name.clone())
+                    .or_insert_with(|| ParamColumnStore {
+                        values: vec![None; self.trial_numbers.len()],
+                        present: vec![0; self.trial_numbers.len().div_ceil(64)],
+                    });
+            column.values[row] = Some(value);
+            bit_set(&mut column.present, row, true);
         }
         self.feasibles_violations.insert(row, (feasible, violation));
         Ok(())
@@ -363,8 +429,9 @@ impl TpeObservationSet {
                 .drain(row * self.n_objectives..(row + 1) * self.n_objectives);
             self.feasibles_violations.remove(row);
             self.param_columns.retain(|_, column| {
-                column.remove(row);
-                column.iter().any(Option::is_some)
+                column.values.remove(row);
+                bit_remove(&mut column.present, row);
+                column.values.iter().any(Option::is_some)
             });
         }
     }
@@ -381,10 +448,14 @@ impl TpeObservationSet {
             n_objectives: self.n_objectives,
             param_columns: sorted_keys
                 .into_iter()
-                .map(|name| TpeObservationColumn {
-                    name,
-                    distribution: &search_space[name],
-                    values: self.param_columns.get(name).map(Vec::as_slice),
+                .map(|name| {
+                    let column = self.param_columns.get(name);
+                    TpeObservationColumn {
+                        name,
+                        distribution: &search_space[name],
+                        values: column.map(|c| c.values.as_slice()),
+                        present: column.map(|c| c.present.as_slice()),
+                    }
                 })
                 .collect(),
             feasibles_violations: &self.feasibles_violations,
@@ -831,29 +902,30 @@ impl TpeSampler {
         recency_ramp: bool,
         previous: Option<ParzenEstimator>,
     ) -> ParzenEstimator {
-        let n_params = observations.param_columns.len();
         let n_trials = rows.len();
+        let n_rows = observations.len();
+        let n_words = n_rows.div_ceil(64);
 
-        // Process trials in chronological (trial-number ascending) order so that the
-        // recency ramp assigns the highest weights to the most recent trials, matching
-        // Optuna's `default_weights`. (Uniform weights are order-invariant, so sorting is
-        // harmless there; the split routines do not preserve chronological order.)
-        let mut order: Vec<usize> = rows.to_vec();
-        order.sort_by_key(|&row| observations.trial_numbers[row]);
-
-        let mut active_counts: Vec<u32> = vec![0; n_trials];
-
+        // Rows observed by every parameter. `trial_numbers` is sorted ascending, so the
+        // set bits already enumerate rows in chronological order and no sort is needed.
+        let mut rows_mask = vec![0_u64; n_words];
+        for &row in rows {
+            rows_mask[row / 64] |= 1 << (row % 64);
+        }
+        let mut active = rows_mask.clone();
         for column in &observations.param_columns {
-            for (trial_idx, &row) in order.iter().enumerate() {
-                if column.at(row).is_some() {
-                    active_counts[trial_idx] += 1;
-                }
+            let Some(present) = column.present else {
+                active.fill(0);
+                break;
+            };
+            for (a, p) in active
+                .iter_mut()
+                .zip(present.iter().copied().chain(std::iter::repeat(0)))
+            {
+                *a &= p;
             }
         }
-        let n_params_u32 = n_params as u32;
-        let active_indices: Vec<usize> = (0..n_trials)
-            .filter(|&idx| active_counts[idx] == n_params_u32)
-            .collect();
+
         // Optuna: single-objective uses the recency ramp (`default_weights`) for both the
         // below (`l(x)`) and above (`g(x)`) estimators; multi-objective uses uniform weights
         // for the below estimator and the recency ramp for the above estimator.
@@ -862,26 +934,34 @@ impl TpeSampler {
         } else {
             vec![1.0; n_trials]
         };
-        let active_weights: Vec<f64> = active_indices.iter().map(|&i| weights[i]).collect();
         let prior_weight = 1.0;
-        let ids: Vec<u32> = active_indices
-            .iter()
-            .map(|&i| observations.trial_numbers[order[i]])
-            .collect();
-        order = active_indices.into_iter().map(|i| order[i]).collect();
-        ParzenEstimator::from_ordered_observations(
-            observations.param_columns.iter().map(|column| {
-                (
-                    column.name,
-                    column.distribution,
-                    order.iter().map(|&row| column.at(row).unwrap()),
-                )
-            }),
+        let mut order = Vec::new();
+        let mut active_weights = Vec::new();
+        let mut ids = Vec::new();
+        for (rank, row) in
+            rustuna_core::internal::parzen_estimator::set_bits(&rows_mask).enumerate()
+        {
+            if bit_get(&active, row) {
+                order.push(row);
+                active_weights.push(weights[rank]);
+                ids.push(observations.trial_numbers[row]);
+            }
+        }
+        let mut model = previous.unwrap_or_default();
+        model.update(
+            &order,
             ids,
             &active_weights,
             prior_weight,
-            previous,
-        )
+            observations.param_columns.iter().map(|column| {
+                rustuna_core::internal::parzen_estimator::ObservationColumn {
+                    name: column.name,
+                    distribution: column.distribution,
+                    values: column.values.unwrap_or(&[]),
+                }
+            }),
+        );
+        model
     }
 }
 
@@ -1944,10 +2024,13 @@ mod tests {
         assert_eq!(history.observations.trial_numbers, [0, 1]);
         assert_eq!(history.observations.values, [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(
-            history.observations.param_columns["x"],
+            history.observations.param_columns["x"].values,
             [Some(0.1), Some(0.2)]
         );
-        assert_eq!(history.observations.param_columns["y"], [None, Some(0.8)]);
+        assert_eq!(
+            history.observations.param_columns["y"].values,
+            [None, Some(0.8)]
+        );
         assert_eq!(
             history.observations.feasibles_violations,
             [(false, 2.0), (true, 0.0)]
