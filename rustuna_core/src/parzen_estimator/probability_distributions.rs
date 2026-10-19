@@ -743,6 +743,9 @@ pub(crate) struct CategoricalDistributions {
     cardinality: usize,
     matching: f64,
     other: f64,
+    log_matching: f64,
+    log_other: f64,
+    log_uniform: f64,
 }
 
 impl CategoricalDistributions {
@@ -770,7 +773,19 @@ impl CategoricalDistributions {
             cardinality,
             matching,
             other,
+            log_matching: matching.ln(),
+            log_other: other.ln(),
+            log_uniform: (1.0 / cardinality as f64).ln(),
         }
+    }
+
+    /// Recomputes `matching`/`other` (and their cached logs) after
+    /// `observed_categories` changes.
+    fn refresh_probabilities(&mut self) {
+        (self.matching, self.other) =
+            categorical_probabilities(self.observed_categories.len(), self.cardinality);
+        self.log_matching = self.matching.ln();
+        self.log_other = self.other.ln();
     }
 
     /// Updates `observed_categories` in place from the column at `order` rows.
@@ -793,8 +808,7 @@ impl CategoricalDistributions {
             &mut old,
             gather,
         );
-        (self.matching, self.other) =
-            categorical_probabilities(self.observed_categories.len(), self.cardinality);
+        self.refresh_probabilities();
     }
 
     fn probability(&self, kernel: usize, category: usize) -> f64 {
@@ -805,18 +819,24 @@ impl CategoricalDistributions {
         }
     }
 
+    fn log_probability(&self, kernel: usize, category: usize) -> f64 {
+        match self.observed_categories.get(kernel) {
+            Some(&observed) if observed == category => self.log_matching,
+            Some(_) => self.log_other,
+            None => self.log_uniform,
+        }
+    }
+
     fn accumulate_log_pdf(&self, category: usize, scores: &mut [f64]) {
         debug_assert_eq!(scores.len(), self.observed_categories.len() + 1);
-        let log_matching = self.matching.ln();
-        let log_other = self.other.ln();
         for (&observed, score) in self.observed_categories.iter().zip(scores.iter_mut()) {
             *score += if observed == category {
-                log_matching
+                self.log_matching
             } else {
-                log_other
+                self.log_other
             };
         }
-        *scores.last_mut().unwrap() += (1.0 / self.cardinality as f64).ln();
+        *scores.last_mut().unwrap() += self.log_uniform;
     }
 }
 
@@ -1207,7 +1227,7 @@ impl MixtureOfProductDistribution {
                 Distributions::DiscreteTruncNorm(d) => d.log_pdf(x, k),
                 Distributions::DiscreteTruncLogNorm(d) if x > 0.0 => d.log_pdf(x, k),
                 Distributions::Categorical(d) if (x as usize) < d.cardinality => {
-                    d.probability(k, x as usize).ln()
+                    d.log_probability(k, x as usize)
                 }
                 _ => return f64::NEG_INFINITY,
             };
