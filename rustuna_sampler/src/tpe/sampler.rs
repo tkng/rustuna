@@ -291,8 +291,9 @@ struct TpeObservationSet {
 /// One parameter column with its presence bitmask.
 #[derive(Clone, Debug, PartialEq)]
 struct ParamColumnStore {
-    values: Vec<Option<f64>>,
-    /// Bit `i` set iff `values[i].is_some()`.
+    /// Present rows hold values; absent slots are NaN placeholders.
+    values: Vec<f64>,
+    /// Bit `i` set iff `values[i]` is a present value.
     present: Vec<u64>,
 }
 
@@ -369,7 +370,7 @@ struct TpeObservationsView<'a> {
 struct TpeObservationColumn<'a> {
     name: &'a str,
     distribution: &'a Distribution,
-    values: Option<&'a [Option<f64>]>,
+    values: Option<&'a [f64]>,
     present: Option<&'a [u64]>,
 }
 
@@ -404,7 +405,7 @@ impl TpeObservationSet {
             values.iter().copied(),
         );
         for column in self.param_columns.values_mut() {
-            column.values.insert(row, None);
+            column.values.insert(row, f64::NAN);
             bit_insert(&mut column.present, row, false);
         }
         for (name, &value) in &trial.internal_params {
@@ -412,10 +413,10 @@ impl TpeObservationSet {
                 self.param_columns
                     .entry(name.clone())
                     .or_insert_with(|| ParamColumnStore {
-                        values: vec![None; self.trial_numbers.len()],
+                        values: vec![f64::NAN; self.trial_numbers.len()],
                         present: vec![0; self.trial_numbers.len().div_ceil(64)],
                     });
-            column.values[row] = Some(value);
+            column.values[row] = value;
             bit_set(&mut column.present, row, true);
         }
         self.feasibles_violations.insert(row, (feasible, violation));
@@ -431,7 +432,7 @@ impl TpeObservationSet {
             self.param_columns.retain(|_, column| {
                 column.values.remove(row);
                 bit_remove(&mut column.present, row);
-                column.values.iter().any(Option::is_some)
+                column.present.iter().any(|&w| w != 0)
             });
         }
     }
@@ -2023,14 +2024,10 @@ mod tests {
             .unwrap();
         assert_eq!(history.observations.trial_numbers, [0, 1]);
         assert_eq!(history.observations.values, [1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(
-            history.observations.param_columns["x"].values,
-            [Some(0.1), Some(0.2)]
-        );
-        assert_eq!(
-            history.observations.param_columns["y"].values,
-            [None, Some(0.8)]
-        );
+        assert_eq!(history.observations.param_columns["x"].values, [0.1, 0.2]);
+        assert_eq!(history.observations.param_columns["y"].values[1], 0.8);
+        assert!(history.observations.param_columns["y"].values[0].is_nan());
+        assert_eq!(history.observations.param_columns["y"].present, [0b10]);
         assert_eq!(
             history.observations.feasibles_violations,
             [(false, 2.0), (true, 0.0)]

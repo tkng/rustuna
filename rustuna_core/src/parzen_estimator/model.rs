@@ -74,12 +74,12 @@ impl ParzenEstimator {
 
         let mut keys: Vec<_> = search_space.keys().collect();
         keys.sort();
-        let owned: Vec<Vec<Option<f64>>> = keys
+        let owned: Vec<Vec<f64>> = keys
             .iter()
             .map(|key| {
                 observations
                     .get(key.as_str())
-                    .map(|v| v.iter().map(|&x| Some(x)).collect())
+                    .map(|v| v.to_vec())
                     .unwrap_or_default()
             })
             .collect();
@@ -117,10 +117,10 @@ impl ParzenEstimator {
         I: IntoIterator<Item = (&'a str, &'a Distribution, V)>,
         V: IntoIterator<Item = f64>,
     {
-        let owned: Vec<(String, &Distribution, Vec<Option<f64>>)> = parameters
+        let owned: Vec<(String, &Distribution, Vec<f64>)> = parameters
             .into_iter()
             .map(|(name, distribution, values)| {
-                let values: Vec<Option<f64>> = values.into_iter().map(Some).collect();
+                let values: Vec<f64> = values.into_iter().collect();
                 assert_eq!(
                     values.len(),
                     observation_ids.len(),
@@ -381,8 +381,8 @@ mod tests {
             1.0,
             None,
         );
-        let mut columns: Vec<Vec<Option<f64>>> =
-            vec![vec![None; initial + 2 * rounds]; dists.len()];
+        let mut columns: Vec<Vec<f64>> =
+            vec![vec![f64::NAN; initial + 2 * rounds]; dists.len()];
         for round in 0..rounds {
             mutate(&mut obs, &mut ids, &mut rng);
             let n = ids.len();
@@ -391,7 +391,7 @@ mod tests {
             for (values, column) in obs.iter().zip(&mut columns) {
                 assert_eq!(values.len(), n);
                 for (cell, &v) in column.iter_mut().zip(values) {
-                    *cell = Some(v);
+                    *cell = v;
                 }
             }
             model.update(

@@ -157,7 +157,7 @@ impl KernelUpdate {
 /// Inputs shared by the kernel-table update of one parameter: the column
 /// values, which rows they occupy, and how the new rows map onto old kernels.
 struct NormalUpdate<'a> {
-    values: &'a [Option<f64>],
+    values: &'a [f64],
     order: &'a [usize],
     adj_low: f64,
     adj_high: f64,
@@ -240,12 +240,13 @@ fn update_log_consts(
 }
 
 /// One search-space parameter's values in storage row order.
-/// Entries at `order` positions must be `Some`; other entries are never read.
+/// Entries at `order` positions hold selected values; other entries are
+/// never read and may contain anything.
 #[doc(hidden)]
 pub struct ObservationColumn<'a> {
     pub name: &'a str,
     pub distribution: &'a crate::distribution::Distribution,
-    pub values: &'a [Option<f64>],
+    pub values: &'a [f64],
 }
 
 /// Fixed-width bins over `(low, high]` tracking each bin's min/max extreme and
@@ -270,7 +271,7 @@ fn update_normal(
     let (values, order, log) = (ctx.values, ctx.order, ctx.log);
     let n = order.len();
     let gather = |i: usize| -> f64 {
-        let v = values[order[i]].expect("observation column lacks a selected value");
+        let v = values[order[i]];
         if log {
             v.ln()
         } else {
@@ -777,13 +778,12 @@ impl CategoricalDistributions {
     /// categories are kept or moved without re-reading the column.
     pub(crate) fn update_categories(
         &mut self,
-        values: &[Option<f64>],
+        values: &[f64],
         order: &[usize],
         update: &KernelUpdate,
         trusted: bool,
     ) {
-        let gather =
-            |i: usize| values[order[i]].expect("categorical lacks a selected value") as usize;
+        let gather = |i: usize| values[order[i]] as usize;
         let mut old = Vec::new();
         gather_column(
             &mut self.observed_categories,
