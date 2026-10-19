@@ -739,7 +739,7 @@ fn categorical_probabilities(n_observed: usize, cardinality: usize) -> (f64, f64
 pub(crate) struct CategoricalDistributions {
     // Each observation contributes a uniform mass plus a spike at its category.
     // The final kernel is the uniform prior. Joint mixtures retain row identity.
-    observed_categories: Vec<usize>,
+    observed_categories: Vec<u32>,
     cardinality: usize,
     matching: f64,
     other: f64,
@@ -758,14 +758,14 @@ impl CategoricalDistributions {
         for value in observations {
             let category = value as usize;
             assert!(category < cardinality, "Observed category is out of range");
-            observed_categories.push(category);
+            observed_categories.push(category as u32);
         }
         Self::with_categories(observed_categories, cardinality)
     }
 
     /// Builds from an already materialized category list, e.g. kept and appended
     /// categories on incremental updates.
-    pub(crate) fn with_categories(observed_categories: Vec<usize>, cardinality: usize) -> Self {
+    pub(crate) fn with_categories(observed_categories: Vec<u32>, cardinality: usize) -> Self {
         assert!(cardinality > 0, "Categorical cardinality must be positive");
         let (matching, other) = categorical_probabilities(observed_categories.len(), cardinality);
         Self {
@@ -798,7 +798,7 @@ impl CategoricalDistributions {
         update: &KernelUpdate,
         trusted: bool,
     ) {
-        let gather = |i: usize| values[order[i]] as usize;
+        let gather = |i: usize| values[order[i]] as u32;
         let mut old = Vec::new();
         gather_column(
             &mut self.observed_categories,
@@ -813,7 +813,7 @@ impl CategoricalDistributions {
 
     fn probability(&self, kernel: usize, category: usize) -> f64 {
         match self.observed_categories.get(kernel) {
-            Some(&observed) if observed == category => self.matching,
+            Some(&observed) if observed as usize == category => self.matching,
             Some(_) => self.other,
             None => 1.0 / self.cardinality as f64,
         }
@@ -821,7 +821,7 @@ impl CategoricalDistributions {
 
     fn log_probability(&self, kernel: usize, category: usize) -> f64 {
         match self.observed_categories.get(kernel) {
-            Some(&observed) if observed == category => self.log_matching,
+            Some(&observed) if observed as usize == category => self.log_matching,
             Some(_) => self.log_other,
             None => self.log_uniform,
         }
@@ -830,7 +830,7 @@ impl CategoricalDistributions {
     fn accumulate_log_pdf(&self, category: usize, scores: &mut [f64]) {
         debug_assert_eq!(scores.len(), self.observed_categories.len() + 1);
         for (&observed, score) in self.observed_categories.iter().zip(scores.iter_mut()) {
-            *score += if observed == category {
+            *score += if observed as usize == category {
                 self.log_matching
             } else {
                 self.log_other
