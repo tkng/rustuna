@@ -1157,14 +1157,32 @@ impl MixtureOfProductDistribution {
     }
 
     pub fn log_pdf(&self, x: &HashMap<String, f64>) -> f64 {
-        self.log_pdf_values(self.param_names.iter().map(|name| x.get(name).copied()))
+        self.log_pdf_values(
+            self.param_names.iter().map(|name| x.get(name).copied()),
+            None,
+        )
+        .unwrap()
     }
 
     pub fn log_pdf_ordered(&self, values: &[f64]) -> f64 {
         if values.len() != self.distributions.len() {
             return f64::NEG_INFINITY;
         }
-        self.log_pdf_values(values.iter().copied().map(Some))
+        self.log_pdf_values(values.iter().copied().map(Some), None)
+            .unwrap()
+    }
+
+    /// Returns `None` only when the acquisition score cannot reach `best`.
+    pub(crate) fn log_pdf_ordered_bounded(
+        &self,
+        values: &[f64],
+        good: f64,
+        best: f64,
+    ) -> Option<f64> {
+        if values.len() != self.distributions.len() {
+            return Some(f64::NEG_INFINITY);
+        }
+        self.log_pdf_values(values.iter().copied().map(Some), Some((good, best)))
     }
 
     /// The weighted prior component bounds the mixture from below. Keep its arithmetic
@@ -1197,25 +1215,29 @@ impl MixtureOfProductDistribution {
         (score + self.log_weights[k]) - self.log_sum_weights
     }
 
-    fn log_pdf_values(&self, values: impl Iterator<Item = Option<f64>>) -> f64 {
+    fn log_pdf_values(
+        &self,
+        values: impl Iterator<Item = Option<f64>>,
+        cutoff: Option<(f64, f64)>,
+    ) -> Option<f64> {
         let n = self.n_kernels;
         let mut weighted_log_pdf = vec![0.0_f64; n];
 
         for (dist, value) in self.distributions.iter().zip(values) {
             let Some(x_val) = value else {
-                return f64::NEG_INFINITY;
+                return Some(f64::NEG_INFINITY);
             };
 
             match dist {
                 Distributions::TruncNorm(d) => {
                     if x_val < d.low || x_val > d.high {
-                        return f64::NEG_INFINITY;
+                        return Some(f64::NEG_INFINITY);
                     }
                     d.accumulate_log_pdf(x_val, &mut weighted_log_pdf);
                 }
                 Distributions::TruncLogNorm(d) => {
                     if x_val <= 0.0 || x_val < d.low || x_val > d.high {
-                        return f64::NEG_INFINITY;
+                        return Some(f64::NEG_INFINITY);
                     }
                     d.accumulate_log_pdf(x_val.ln(), &mut weighted_log_pdf);
                 }
@@ -1234,7 +1256,7 @@ impl MixtureOfProductDistribution {
                 }
                 Distributions::DiscreteTruncLogNorm(d) => {
                     if x_val <= 0.0 {
-                        return f64::NEG_INFINITY;
+                        return Some(f64::NEG_INFINITY);
                     }
                     for (k, weight) in weighted_log_pdf.iter_mut().enumerate().take(n) {
                         if *weight == f64::NEG_INFINITY {
@@ -1251,7 +1273,7 @@ impl MixtureOfProductDistribution {
                 Distributions::Categorical(d) => {
                     let xi = x_val as usize;
                     if xi >= d.cardinality {
-                        return f64::NEG_INFINITY;
+                        return Some(f64::NEG_INFINITY);
                     }
                     d.accumulate_log_pdf(xi, &mut weighted_log_pdf);
                 }
@@ -1276,11 +1298,21 @@ impl MixtureOfProductDistribution {
         if max.is_infinite() && max.is_sign_negative() {
             // All -inf -> return -inf
 
-            return f64::NEG_INFINITY;
+            return Some(f64::NEG_INFINITY);
+        }
+        // sum_exp >= 1 makes `max - log_sum_weights` a lower bound: once the
+        // acquisition `good - poor` cannot reach `best`, skip the exp() calls.
+        if cutoff.is_some_and(|(good, best)| {
+            good.is_finite()
+                && best.is_finite()
+                && max.is_finite()
+                && good - (max - self.log_sum_weights) < best
+        }) {
+            return None;
         }
         let sum_exp: f64 = weighted_log_pdf.iter().map(|v| (v - max).exp()).sum();
         // Weights are basically normalized, but sum to 1 may not hold due to float rounding error
-        (max + sum_exp.ln()) - self.log_sum_weights // Normalize by total weight to avoid float rounding error
+        Some((max + sum_exp.ln()) - self.log_sum_weights) // Normalize by total weight to avoid float rounding error
     }
 }
 
@@ -1288,6 +1320,41 @@ impl MixtureOfProductDistribution {
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    #[test]
+    fn bounded_density_preserves_complete_scores_and_ties() {
+        let mixture = MixtureOfProductDistribution::new(
+            vec![(
+                "x".to_string(),
+                Distributions::TruncNorm(TruncNormDistributions {
+                    mus: vec![-0.5, 0.0],
+                    sigmas: vec![2.0, 1.0],
+                    low: -1.0,
+                    high: 1.0,
+                    log_consts: vec![0.0, 0.0],
+                }),
+            )],
+            vec![0.5, 0.5],
+        );
+        // `Some(v)` must bit-match `log_pdf_ordered`; `None` is only allowed
+        // when the exact acquisition `good - v` stays below `best`. NaN and
+        // infinite inputs must never cut off evaluation.
+        for x in [-0.5, 0.0, 0.25, f64::NAN, f64::INFINITY] {
+            let values = [x];
+            let exact = mixture.log_pdf_ordered(&values);
+            for good in [f64::NEG_INFINITY, -1.0, 0.0, 1.0, f64::INFINITY, f64::NAN] {
+                for best in [f64::NEG_INFINITY, -1.0, 0.0, 1.0, f64::INFINITY, f64::NAN] {
+                    match mixture.log_pdf_ordered_bounded(&values, good, best) {
+                        Some(v) => assert_eq!(v.to_bits(), exact.to_bits(), "x={x}"),
+                        None => {
+                            assert!(good.is_finite() && best.is_finite() && exact.is_finite());
+                            assert!(good - exact < best, "x={x} good={good} best={best}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn unchanged_normalizers_are_reused_after_removing_an_observation() {

@@ -333,7 +333,13 @@ impl ParzenEstimator {
             if upper < best_val {
                 break;
             }
-            let acquisition = good - poor.log_pdf_ordered(&samples[i]);
+            let Some(poor_density) =
+                poor.mixuture_distribution
+                    .log_pdf_ordered_bounded(&samples[i], good, best_val)
+            else {
+                continue;
+            };
+            let acquisition = good - poor_density;
             if acquisition > best_val || (acquisition == best_val && i < best_idx) {
                 best_val = acquisition;
                 best_idx = i;
