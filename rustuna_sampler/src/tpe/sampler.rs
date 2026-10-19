@@ -868,12 +868,13 @@ impl TpeSampler {
             .iter()
             .map(|&i| observations.trial_numbers[order[i]])
             .collect();
+        order = active_indices.into_iter().map(|i| order[i]).collect();
         ParzenEstimator::from_ordered_observations(
             observations.param_columns.iter().map(|column| {
                 (
                     column.name,
                     column.distribution,
-                    order.iter().filter_map(|&row| column.at(row)),
+                    order.iter().map(|&row| column.at(row).unwrap()),
                 )
             }),
             ids,
