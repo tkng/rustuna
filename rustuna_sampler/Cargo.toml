@@ -13,5 +13,6 @@ qmc = []
 
 [dependencies]
 rand = { workspace = true }
+rand_distr = "0.4.3"
 rustuna_core = { workspace = true }
 serde_json = "1"

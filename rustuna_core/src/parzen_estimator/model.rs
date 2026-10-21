@@ -1,7 +1,7 @@
 use rand::rngs::StdRng;
 use std::collections::HashMap;
-use std::iter::once;
 
+use super::normalized_weights;
 #[cfg(test)]
 use super::probability_distributions::binned_sigmas;
 use super::probability_distributions::{
@@ -11,6 +11,8 @@ use super::probability_distributions::{
 use crate::distribution::Distribution;
 use crate::parzen_estimator::scott::ScottNumericalDistributionBuilder;
 
+/// Incrementally fitted mixture model shared by TPE and importance evaluation.
+/// Retains density coefficients and update state, but no component-selection table.
 pub struct ParzenEstimator {
     mixuture_distribution: MixtureOfProductDistribution,
     observation_ids: Vec<u32>,
@@ -152,6 +154,8 @@ impl ParzenEstimator {
     /// Rebuilds this model from `columns` at the rows given by `order`, in strictly
     /// increasing parameter-name order. Kernels for observations already present in
     /// this model are reused; only newly added observations are read from the columns.
+    /// Returns the normalized weights used for this update so candidate generation
+    /// can consume them. Density-only callers can discard these temporary values.
     #[doc(hidden)]
     pub fn update<'a, I>(
         &mut self,
@@ -160,7 +164,8 @@ impl ParzenEstimator {
         weights: &[f64],
         prior_weight: f64,
         columns: I,
-    ) where
+    ) -> Vec<f64>
+    where
         I: IntoIterator<Item = ObservationColumn<'a>>,
     {
         self.update_with(
@@ -171,7 +176,7 @@ impl ParzenEstimator {
             columns,
             None,
             true,
-        );
+        )
     }
 
     fn update_with<'a, I>(
@@ -183,7 +188,8 @@ impl ParzenEstimator {
         columns: I,
         scott: Option<&ScottNumericalDistributionBuilder>,
         trusted: bool,
-    ) where
+    ) -> Vec<f64>
+    where
         I: IntoIterator<Item = ObservationColumn<'a>>,
     {
         assert_eq!(order.len(), observation_ids.len());
@@ -253,43 +259,28 @@ impl ParzenEstimator {
             n_kernels.is_none_or(|k| k == observation_ids.len() + 1),
             "Observation columns and weights differ in length"
         );
-        let sum_w = {
-            let s = weights.iter().sum::<f64>() + prior_weight;
-            if s == 0.0 {
-                (weights.len() + 1) as f64
-            } else {
-                s
-            }
-        };
-        m.set_weights(
-            weights
-                .iter()
-                .copied()
-                .chain(once(prior_weight))
-                .map(|w| w / sum_w)
-                .collect(),
-        );
+        let weights = normalized_weights(weights, prior_weight);
+        m.set_weights(&weights);
         self.observation_ids = observation_ids;
-    }
-    pub fn sample(&self, rng: &mut StdRng, size: usize) -> Vec<HashMap<String, f64>> {
-        self.mixuture_distribution.sample(rng, size)
+        weights
     }
 
-    /// Returns the parameter names used by ordered samples and scores.
+    /// Parameter names in the order used by component draws and density values.
     pub fn parameter_names(&self) -> &[String] {
         &self.mixuture_distribution.param_names
     }
 
-    /// Samples values in [`Self::parameter_names`] order.
-    pub fn sample_ordered(&self, rng: &mut StdRng, size: usize) -> Vec<Vec<f64>> {
-        self.mixuture_distribution.sample_ordered(rng, size)
+    /// Number of mixture components, including the trailing prior.
+    pub fn component_count(&self) -> usize {
+        self.mixuture_distribution.n_kernels
     }
 
-    /// Samples into a caller-owned buffer so row allocations are reused.
-    #[doc(hidden)]
-    pub fn sample_ordered_into(&self, rng: &mut StdRng, size: usize, samples: &mut Vec<Vec<f64>>) {
+    /// Draws one point from a caller-selected component into a reusable row.
+    /// Values follow [`Self::parameter_names`]; component selection belongs to the caller.
+    #[inline]
+    pub fn draw_component(&self, rng: &mut StdRng, component: usize, values: &mut Vec<f64>) {
         self.mixuture_distribution
-            .sample_ordered_into(rng, size, samples)
+            .draw_component(rng, component, values)
     }
 
     pub fn log_pdf(&self, x: &HashMap<String, f64>) -> f64 {
@@ -302,57 +293,20 @@ impl ParzenEstimator {
         self.mixuture_distribution.log_pdf_ordered(values)
     }
 
-    /// Maximizes `self.log_pdf_ordered(x) - poor.log_pdf_ordered(x)`, keeping the first tie.
-    /// For joint models, prior-based upper bounds skip candidates that cannot win.
-    pub fn best_candidate_index(&self, poor: &Self, samples: &[Vec<f64>]) -> usize {
-        let mut ranked = Vec::new();
-        if self.parameter_names().len() > 1 {
-            ranked = samples
-                .iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    let good = self.log_pdf_ordered(x);
-                    let bound = good - poor.mixuture_distribution.log_pdf_prior_ordered(x);
-                    // Unusable bounds must always receive a full evaluation.
-                    let upper = if bound.is_finite() {
-                        bound
-                    } else {
-                        f64::INFINITY
-                    };
-                    (i, good, upper)
-                })
-                .collect::<Vec<_>>();
-            ranked.sort_unstable_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
-        }
-        let mut best_idx = 0;
-        let mut best_val = f64::NEG_INFINITY;
-        for position in 0..samples.len() {
-            let (i, good, upper) = if ranked.is_empty() {
-                // A single prior is usually too weak a bound for independent TPE.
-                (
-                    position,
-                    self.log_pdf_ordered(&samples[position]),
-                    f64::INFINITY,
-                )
-            } else {
-                ranked[position]
-            };
-            if upper < best_val {
-                break;
-            }
-            let Some(poor_density) =
-                poor.mixuture_distribution
-                    .log_pdf_ordered_bounded(&samples[i], good, best_val)
-            else {
-                continue;
-            };
-            let acquisition = good - poor_density;
-            if acquisition > best_val || (acquisition == best_val && i < best_idx) {
-                best_val = acquisition;
-                best_idx = i;
-            }
-        }
-        best_idx
+    /// Log density of the weighted prior component; a lower bound on the mixture.
+    pub fn log_pdf_prior_ordered(&self, values: &[f64]) -> f64 {
+        self.mixuture_distribution.log_pdf_prior_ordered(values)
+    }
+
+    /// Evaluates the mixture unless `stop` rejects a finite lower bound on its log density.
+    /// Returns `None` only when `stop` requests early termination.
+    pub fn log_pdf_ordered_with_lower_bound(
+        &self,
+        values: &[f64],
+        stop: impl FnOnce(f64) -> bool,
+    ) -> Option<f64> {
+        self.mixuture_distribution
+            .log_pdf_ordered_with_lower_bound(values, stop)
     }
 }
 
@@ -360,6 +314,12 @@ impl ParzenEstimator {
 mod tests {
     use super::*;
     use rand::{Rng, SeedableRng};
+
+    fn draw(model: &ParzenEstimator, rng: &mut StdRng, component: usize) -> Vec<f64> {
+        let mut values = Vec::new();
+        model.draw_component(rng, component, &mut values);
+        values
+    }
 
     /// Repeated `update` calls after `mutate` must match a fresh rebuild
     /// of the same observation set bit-for-bit.
@@ -477,38 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn candidate_pruning_matches_exhaustive_scoring() {
-        let space = Distribution::new_float(-5.0, 5.0, None, false);
-        let model = |values: &[f64], prior| {
-            ParzenEstimator::from_ordered_observations(
-                ["x", "y"].map(|name| (name, &space, values.iter().copied())),
-                (0..values.len() as u32).collect(),
-                &vec![1.0; values.len()],
-                prior,
-                None,
-            )
-        };
-        let good = model(&[-3.0, -2.0, -1.0], 1.0);
-        for prior in [0.0, 1.0] {
-            let poor = model(&[-3.0, -2.0, -1.0, 0.0, 1.0, 2.0], prior);
-            let mut samples = good.sample_ordered(&mut StdRng::seed_from_u64(42), 24);
-            let invalid = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY].map(|v| vec![v; 2]);
-            assert_eq!(good.best_candidate_index(&poor, &invalid), 0);
-            samples.splice(0..0, invalid);
-            let (mut index, mut best) = (0, f64::NEG_INFINITY);
-            for (i, x) in samples.iter().enumerate() {
-                let score = good.log_pdf_ordered(x) - poor.log_pdf_ordered(x);
-                if score > best {
-                    (index, best) = (i, score);
-                }
-            }
-            assert_eq!(good.best_candidate_index(&poor, &samples), index);
-            let ties = [vec![4.9; 2], vec![0.0; 2]];
-            assert_eq!(poor.best_candidate_index(&poor, &ties), 0);
-        }
-    }
-
-    #[test]
     fn reused_normalizers_match_rebuilt_models_across_history_changes() {
         let mut previous = None;
         let mut rng = StdRng::seed_from_u64(931);
@@ -561,12 +489,13 @@ mod tests {
             );
             let mut a = StdRng::seed_from_u64(42);
             let mut b = StdRng::seed_from_u64(42);
-            let samples = fresh.sample_ordered(&mut a, 100);
-            assert_eq!(samples, cached.sample_ordered(&mut b, 100));
-            for x in &samples {
+            for i in 0..100 {
+                let component = i % fresh.component_count();
+                let x = draw(&fresh, &mut a, component);
+                assert_eq!(x, draw(&cached, &mut b, component));
                 assert_eq!(
-                    fresh.log_pdf_ordered(x).to_bits(),
-                    cached.log_pdf_ordered(x).to_bits(),
+                    fresh.log_pdf_ordered(&x).to_bits(),
+                    cached.log_pdf_ordered(&x).to_bits(),
                     "step={step}"
                 );
             }
@@ -699,42 +628,38 @@ mod tests {
             None,
         );
         let mut rng = StdRng::seed_from_u64(42);
-        let samples = parzen_estimator.sample(&mut rng, 10);
-        let mut ordered_rng = StdRng::seed_from_u64(42);
-        let ordered = parzen_estimator.sample_ordered(&mut ordered_rng, 10);
         let mut streamed_rng = StdRng::seed_from_u64(42);
-        assert_eq!(ordered, streamed.sample_ordered(&mut streamed_rng, 10));
         assert_eq!(
             parzen_estimator.parameter_names(),
             ["a", "b", "c", "d", "e"]
         );
-        for (sample, values) in samples.iter().zip(&ordered) {
-            assert_eq!(
-                *values,
-                ["a", "b", "c", "d", "e"].map(|name| sample[name]).to_vec()
-            );
-            assert_eq!(
-                parzen_estimator.log_pdf(sample).to_bits(),
-                parzen_estimator.log_pdf_ordered(values).to_bits()
-            );
-            assert_eq!(
-                parzen_estimator.log_pdf_ordered(values).to_bits(),
-                streamed.log_pdf_ordered(values).to_bits()
-            );
+        let mut samples = Vec::new();
+        for i in 0..10 {
+            let component = i % parzen_estimator.component_count();
+            let values = draw(&parzen_estimator, &mut rng, component);
+            assert_eq!(values, draw(&streamed, &mut streamed_rng, component));
+            let sample: HashMap<String, f64> = parzen_estimator
+                .parameter_names()
+                .iter()
+                .cloned()
+                .zip(values.iter().copied())
+                .collect();
+            let expected = parzen_estimator.log_pdf_ordered(&values).to_bits();
+            assert_eq!(parzen_estimator.log_pdf(&sample).to_bits(), expected);
+            assert_eq!(streamed.log_pdf_ordered(&values).to_bits(), expected);
+            samples.push(sample);
         }
         assert_eq!(
             rand::RngCore::next_u64(&mut rng),
-            rand::RngCore::next_u64(&mut ordered_rng)
+            rand::RngCore::next_u64(&mut streamed_rng)
         );
         assert_eq!(parzen_estimator.log_pdf_ordered(&[]), f64::NEG_INFINITY);
         assert_eq!(
             parzen_estimator.log_pdf_ordered(&[0.0; 6]),
             f64::NEG_INFINITY
         );
-        let mut invalid = ordered[0].clone();
-        invalid[0] = -1.0;
         assert_eq!(
-            parzen_estimator.log_pdf_ordered(&invalid),
+            parzen_estimator.log_pdf_ordered(&[-1.0; 5]),
             f64::NEG_INFINITY
         );
         assert_eq!(samples.len(), 10);

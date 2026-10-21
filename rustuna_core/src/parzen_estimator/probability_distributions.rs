@@ -2,7 +2,6 @@ use super::scott::ScottNumericalDistributionBuilder;
 use super::truncnorm;
 use rand::rngs::StdRng;
 use rand::Rng;
-use rand_distr::{Distribution as RandDistribution, WeightedAliasIndex};
 use std::collections::HashMap;
 
 use super::truncnorm::NEG_HALF_LOG_2PI;
@@ -1022,177 +1021,133 @@ pub(crate) struct MixtureOfProductDistribution {
     pub distributions: Vec<Distributions>, // Sorted distributions
     pub log_weights: Vec<f64>,             // ln(w_i)
     pub log_sum_weights: f64,              // ln(sum weights)
-    pub alias: WeightedAliasIndex<f64>,
     pub n_kernels: usize,
 }
 
 impl MixtureOfProductDistribution {
     pub fn new(entries: Vec<(String, Distributions)>, weights: Vec<f64>) -> Self {
         let (param_names, distributions) = entries.into_iter().unzip();
-        let mut mixture = MixtureOfProductDistribution {
+        let mut mixture = Self {
             param_names,
             distributions,
             log_weights: Vec::new(),
             log_sum_weights: 0.0,
-            alias: WeightedAliasIndex::new(vec![1.0])
-                .expect("unit weight is non-empty and non-negative"),
             n_kernels: 0,
         };
-        mixture.set_weights(weights);
+        mixture.set_weights(&weights);
         mixture
     }
 
-    /// Recomputes the sampling weights over the kernels: normalized ln weights,
-    /// their log-sum, and the alias table. `weights` includes the prior's.
-    pub(crate) fn set_weights(&mut self, weights: Vec<f64>) {
+    /// Stores density coefficients derived from the supplied mixture weights.
+    pub(crate) fn set_weights(&mut self, weights: &[f64]) {
         self.log_sum_weights = weights.iter().sum::<f64>().max(0.0).ln();
         self.log_weights = weights.iter().map(|&w| w.max(0.0).ln()).collect();
         self.n_kernels = weights.len();
-        self.alias =
-            WeightedAliasIndex::new(weights).expect("weights must be non-empty and non-negative");
     }
 
-    pub fn sample(&self, rng: &mut StdRng, size: usize) -> Vec<HashMap<String, f64>> {
-        self.sample_ordered(rng, size)
-            .into_iter()
-            .map(|values| self.param_names.iter().cloned().zip(values).collect())
-            .collect()
-    }
-
-    pub fn sample_ordered(&self, rng: &mut StdRng, size: usize) -> Vec<Vec<f64>> {
-        let mut samples = Vec::new();
-        self.sample_ordered_into(rng, size, &mut samples);
-        samples
-    }
-
-    /// `sample_ordered` into a caller-owned buffer so inner row allocations
-    /// are reused across calls.
-    pub(crate) fn sample_ordered_into(
-        &self,
-        rng: &mut StdRng,
-        size: usize,
-        samples: &mut Vec<Vec<f64>>,
-    ) {
-        samples.iter_mut().for_each(Vec::clear);
-        samples.resize_with(size, Vec::new);
-
-        for sample in samples.iter_mut() {
-            let k = self.alias.sample(rng); // Active kernel index
-            for (param, dist) in self.param_names.iter().zip(self.distributions.iter()) {
-                match dist {
-                    Distributions::TruncNorm(d) => {
-                        let mu = d.mus[k];
-                        let sigma = d.sigmas[k];
-                        let value = truncnorm::rvs(
-                            rng,
-                            (d.low - mu) / sigma,
-                            (d.high - mu) / sigma,
-                            mu,
-                            sigma,
-                        )
-                        .unwrap();
-                        sample.push(value);
-                    }
-                    Distributions::TruncLogNorm(d) => {
-                        let mu = d.mus[k];
-                        let sigma = d.sigmas[k];
-                        let log_value = truncnorm::rvs(
-                            rng,
-                            (d.low.ln() - mu) / sigma,
-                            (d.high.ln() - mu) / sigma,
-                            mu,
-                            sigma,
-                        )
-                        .unwrap();
-                        sample.push(log_value.exp());
-                    }
-                    Distributions::DiscreteTruncNorm(d) => {
-                        let mu = d.mus[k];
-                        let sigma = d.sigmas[k];
-                        let value = truncnorm::rvs(
-                            rng,
-                            (d.low - d.step / 2.0 - mu) / sigma,
-                            (d.high + d.step / 2.0 - mu) / sigma,
-                            mu,
-                            sigma,
-                        )
-                        .unwrap();
-                        let discrete_value = (d.low + ((value - d.low) / d.step).round() * d.step)
-                            .max(d.low)
-                            .min(d.high);
-                        sample.push(discrete_value);
-                    }
-                    Distributions::DiscreteTruncLogNorm(d) => {
-                        let mu = d.mus[k];
-                        let sigma = d.sigmas[k];
-                        let log_value = truncnorm::rvs(
-                            rng,
-                            ((d.low - d.step / 2.0).max(f64::MIN_POSITIVE).ln() - mu) / sigma,
-                            ((d.high + d.step / 2.0).max(f64::MIN_POSITIVE).ln() - mu) / sigma,
-                            mu,
-                            sigma,
-                        )
-                        .unwrap();
-                        let original = log_value.exp();
-                        let discrete_value = (d.low
-                            + ((original - d.low) / d.step).round() * d.step)
-                            .max(d.low)
-                            .min(d.high);
-                        sample.push(discrete_value);
-                    }
-                    Distributions::Categorical(d) => {
-                        let sum: f64 = (0..d.cardinality)
-                            .map(|category| d.probability(k, category))
-                            .sum();
-                        assert!(
-                            sum > 0.0,
-                            "Categorical distribution has non-positive total probability for param {param}"
-                        );
-
-                        let u = rng.gen::<f64>() * sum;
-                        let mut cum = 0.0;
-                        let mut chosen = (d.cardinality - 1) as f64; // fallback
-                        for category in 0..d.cardinality {
-                            cum += d.probability(k, category);
-                            if u <= cum {
-                                chosen = category as f64;
-                                break;
-                            }
-                        }
-                        sample.push(chosen);
-                    }
+    #[inline]
+    pub(crate) fn draw_component(&self, rng: &mut StdRng, k: usize, values: &mut Vec<f64>) {
+        assert!(k < self.n_kernels, "mixture component index out of range");
+        values.clear();
+        for (param, dist) in self.param_names.iter().zip(self.distributions.iter()) {
+            values.push(match dist {
+                Distributions::TruncNorm(d) => {
+                    let mu = d.mus[k];
+                    let sigma = d.sigmas[k];
+                    truncnorm::rvs(rng, (d.low - mu) / sigma, (d.high - mu) / sigma, mu, sigma)
+                        .unwrap()
                 }
-            }
+                Distributions::TruncLogNorm(d) => {
+                    let mu = d.mus[k];
+                    let sigma = d.sigmas[k];
+                    truncnorm::rvs(
+                        rng,
+                        (d.low.ln() - mu) / sigma,
+                        (d.high.ln() - mu) / sigma,
+                        mu,
+                        sigma,
+                    )
+                    .unwrap()
+                    .exp()
+                }
+                Distributions::DiscreteTruncNorm(d) => {
+                    let mu = d.mus[k];
+                    let sigma = d.sigmas[k];
+                    let value = truncnorm::rvs(
+                        rng,
+                        (d.low - d.step / 2.0 - mu) / sigma,
+                        (d.high + d.step / 2.0 - mu) / sigma,
+                        mu,
+                        sigma,
+                    )
+                    .unwrap();
+                    (d.low + ((value - d.low) / d.step).round() * d.step)
+                        .max(d.low)
+                        .min(d.high)
+                }
+                Distributions::DiscreteTruncLogNorm(d) => {
+                    let mu = d.mus[k];
+                    let sigma = d.sigmas[k];
+                    let log_value = truncnorm::rvs(
+                        rng,
+                        ((d.low - d.step / 2.0).max(f64::MIN_POSITIVE).ln() - mu) / sigma,
+                        ((d.high + d.step / 2.0).max(f64::MIN_POSITIVE).ln() - mu) / sigma,
+                        mu,
+                        sigma,
+                    )
+                    .unwrap();
+                    let original = log_value.exp();
+                    (d.low + ((original - d.low) / d.step).round() * d.step)
+                        .max(d.low)
+                        .min(d.high)
+                }
+                Distributions::Categorical(d) => {
+                    let sum: f64 = (0..d.cardinality)
+                        .map(|category| d.probability(k, category))
+                        .sum();
+                    assert!(
+                        sum > 0.0,
+                        "Categorical distribution has non-positive total probability for param {param}"
+                    );
+
+                    let u = rng.gen::<f64>() * sum;
+                    let mut cum = 0.0;
+                    let mut chosen = (d.cardinality - 1) as f64; // fallback
+                    for category in 0..d.cardinality {
+                        cum += d.probability(k, category);
+                        if u <= cum {
+                            chosen = category as f64;
+                            break;
+                        }
+                    }
+                    chosen
+                }
+            });
         }
     }
 
     pub fn log_pdf(&self, x: &HashMap<String, f64>) -> f64 {
         self.log_pdf_values(
             self.param_names.iter().map(|name| x.get(name).copied()),
-            None,
+            |_| false,
         )
         .unwrap()
     }
 
     pub fn log_pdf_ordered(&self, values: &[f64]) -> f64 {
-        if values.len() != self.distributions.len() {
-            return f64::NEG_INFINITY;
-        }
-        self.log_pdf_values(values.iter().copied().map(Some), None)
+        self.log_pdf_ordered_with_lower_bound(values, |_| false)
             .unwrap()
     }
 
-    /// Returns `None` only when the acquisition score cannot reach `best`.
-    pub(crate) fn log_pdf_ordered_bounded(
+    pub(crate) fn log_pdf_ordered_with_lower_bound(
         &self,
         values: &[f64],
-        good: f64,
-        best: f64,
+        stop: impl FnOnce(f64) -> bool,
     ) -> Option<f64> {
         if values.len() != self.distributions.len() {
             return Some(f64::NEG_INFINITY);
         }
-        self.log_pdf_values(values.iter().copied().map(Some), Some((good, best)))
+        self.log_pdf_values(values.iter().copied().map(Some), stop)
     }
 
     /// The weighted prior component bounds the mixture from below. Keep its arithmetic
@@ -1228,7 +1183,7 @@ impl MixtureOfProductDistribution {
     fn log_pdf_values(
         &self,
         values: impl Iterator<Item = Option<f64>>,
-        cutoff: Option<(f64, f64)>,
+        stop: impl FnOnce(f64) -> bool,
     ) -> Option<f64> {
         let n = self.n_kernels;
         let mut weighted_log_pdf = vec![0.0_f64; n];
@@ -1310,14 +1265,8 @@ impl MixtureOfProductDistribution {
 
             return Some(f64::NEG_INFINITY);
         }
-        // sum_exp >= 1 makes `max - log_sum_weights` a lower bound: once the
-        // acquisition `good - poor` cannot reach `best`, skip the exp() calls.
-        if cutoff.is_some_and(|(good, best)| {
-            good.is_finite()
-                && best.is_finite()
-                && max.is_finite()
-                && good - (max - self.log_sum_weights) < best
-        }) {
+        // sum_exp >= 1 makes max - log_sum_weights a lower bound on log density.
+        if max.is_finite() && stop(max - self.log_sum_weights) {
             return None;
         }
         let sum_exp: f64 = weighted_log_pdf.iter().map(|v| (v - max).exp()).sum();
@@ -1332,7 +1281,7 @@ mod tests {
     use rand::SeedableRng;
 
     #[test]
-    fn bounded_density_preserves_complete_scores_and_ties() {
+    fn log_density_lower_bounds_allow_early_termination() {
         let mixture = MixtureOfProductDistribution::new(
             vec![(
                 "x".to_string(),
@@ -1346,21 +1295,18 @@ mod tests {
             )],
             vec![0.5, 0.5],
         );
-        // `Some(v)` must bit-match `log_pdf_ordered`; `None` is only allowed
-        // when the exact acquisition `good - v` stays below `best`. NaN and
-        // infinite inputs must never cut off evaluation.
+        // Early termination is valid only after a finite lower bound is available.
+        // Returning a density must preserve the complete calculation bit-for-bit.
         for x in [-0.5, 0.0, 0.25, f64::NAN, f64::INFINITY] {
             let values = [x];
             let exact = mixture.log_pdf_ordered(&values);
-            for good in [f64::NEG_INFINITY, -1.0, 0.0, 1.0, f64::INFINITY, f64::NAN] {
-                for best in [f64::NEG_INFINITY, -1.0, 0.0, 1.0, f64::INFINITY, f64::NAN] {
-                    match mixture.log_pdf_ordered_bounded(&values, good, best) {
-                        Some(v) => assert_eq!(v.to_bits(), exact.to_bits(), "x={x}"),
-                        None => {
-                            assert!(good.is_finite() && best.is_finite() && exact.is_finite());
-                            assert!(good - exact < best, "x={x} good={good} best={best}");
-                        }
-                    }
+            for threshold in [f64::NEG_INFINITY, -1.0, 0.0, 1.0, f64::INFINITY, f64::NAN] {
+                match mixture.log_pdf_ordered_with_lower_bound(&values, |lower| {
+                    assert!(lower.is_finite() && lower <= exact);
+                    lower > threshold
+                }) {
+                    Some(value) => assert_eq!(value.to_bits(), exact.to_bits()),
+                    None => assert!(exact.is_finite() && exact > threshold),
                 }
             }
         }
@@ -1446,7 +1392,13 @@ mod tests {
             vec![0.5, 0.5], // weights.len() == mus.len()
         );
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let samples = mixture.sample(&mut rng, 10);
+        let samples: Vec<HashMap<String, f64>> = (0..10)
+            .map(|i| {
+                let mut values = Vec::new();
+                mixture.draw_component(&mut rng, i % mixture.n_kernels, &mut values);
+                mixture.param_names.iter().cloned().zip(values).collect()
+            })
+            .collect();
         for sample in samples.iter() {
             let values: Vec<_> = mixture.param_names.iter().map(|key| sample[key]).collect();
             assert!(mixture.log_pdf_prior_ordered(&values) <= mixture.log_pdf(sample));
@@ -1525,15 +1477,5 @@ mod tests {
             mixture.log_pdf(&HashMap::from([("x".into(), 0.0)])),
             f64::NEG_INFINITY
         );
-        let mut rng = StdRng::seed_from_u64(42);
-        let samples = mixture.sample(&mut rng, 20_000);
-        let equal = samples
-            .iter()
-            .filter(|sample| sample["x"] == sample["y"])
-            .count() as f64
-            / samples.len() as f64;
-        // Both observed kernels give P(x=y)=0.8^2+0.2^2; the prior gives 0.5.
-        let expected_equal = (3.0 * (matching * matching + other * other) + 0.5 * 0.5) / 3.5;
-        assert!((equal - expected_equal).abs() < 0.015);
     }
 }

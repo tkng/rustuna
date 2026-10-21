@@ -7,13 +7,15 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rustuna_core::distribution::Distribution;
 use rustuna_core::internal::multi_objective;
-use rustuna_core::internal::parzen_estimator::ParzenEstimator;
+use rustuna_core::internal::parzen_estimator::{set_bits, ObservationColumn, ParzenEstimator};
 use rustuna_core::sampler::{Context, RandomSampler, Sampler};
 use rustuna_core::storage::Storage;
 use rustuna_core::study::Direction;
 use rustuna_core::trial::{PersistedTrial, TrialState, TrialStateValues};
 use rustuna_core::Result;
 use rustuna_core::{Error, ErrorKind};
+
+use super::{acquisition, candidates};
 
 /// Builder for [`TpeSampler`], following the API style of [`std::thread::Builder`].
 ///
@@ -538,7 +540,7 @@ pub struct TpeSampler {
     /// Study columns are retained between trials. Storage is locked before
     /// this cache during updates; both are released before model construction.
     observations_cache: RwLock<ObservationsCache>,
-    /// Reusable candidate buffers for `sample_ordered_into`.
+    /// Reusable candidate buffers for TPE's candidate generation.
     samples_scratch: Mutex<Vec<Vec<f64>>>,
 }
 impl Default for TpeSampler {
@@ -655,13 +657,13 @@ impl TpeSampler {
         let (previous_good, previous_poor) = previous
             .map(|(good, poor)| (Some(good), Some(poor)))
             .unwrap_or_default();
-        let good = Self::build_parzen_estimator(
+        let (good, good_weights) = Self::build_parzen_estimator(
             observations,
             &good_rows,
             good_recency_ramp,
             previous_good,
         );
-        let poor = Self::build_parzen_estimator(observations, &poor_rows, true, previous_poor);
+        let (poor, _) = Self::build_parzen_estimator(observations, &poor_rows, true, previous_poor);
 
         assert_eq!(good.parameter_names(), poor.parameter_names());
         let n_ei_candidates = 24;
@@ -678,9 +680,15 @@ impl TpeSampler {
                     format!("Failed to acquire RNG guard: {e}"),
                 )
             })?;
-            good.sample_ordered_into(&mut rng, n_ei_candidates, &mut scratch);
+            candidates::generate_candidates(
+                &good,
+                good_weights,
+                &mut rng,
+                n_ei_candidates,
+                &mut scratch,
+            );
         }
-        let best_idx = good.best_candidate_index(&poor, &scratch);
+        let best_idx = acquisition::best_candidate_index(&good, &poor, &scratch);
         let best_sample = std::mem::take(&mut scratch[best_idx]);
         drop(scratch);
         let result = good
@@ -913,7 +921,7 @@ impl TpeSampler {
         rows: &[usize],
         recency_ramp: bool,
         previous: Option<ParzenEstimator>,
-    ) -> ParzenEstimator {
+    ) -> (ParzenEstimator, Vec<f64>) {
         let n_trials = rows.len();
         let n_rows = observations.len();
         let n_words = n_rows.div_ceil(64);
@@ -950,9 +958,7 @@ impl TpeSampler {
         let mut order = Vec::new();
         let mut active_weights = Vec::new();
         let mut ids = Vec::new();
-        for (rank, row) in
-            rustuna_core::internal::parzen_estimator::set_bits(&rows_mask).enumerate()
-        {
+        for (rank, row) in set_bits(&rows_mask).enumerate() {
             if bit_get(&active, row) {
                 order.push(row);
                 active_weights.push(weights[rank]);
@@ -960,20 +966,21 @@ impl TpeSampler {
             }
         }
         let mut model = previous.unwrap_or_default();
-        model.update(
+        let weights = model.update(
             &order,
             ids,
             &active_weights,
             prior_weight,
-            observations.param_columns.iter().map(|column| {
-                rustuna_core::internal::parzen_estimator::ObservationColumn {
+            observations
+                .param_columns
+                .iter()
+                .map(|column| ObservationColumn {
                     name: column.name,
                     distribution: column.distribution,
                     values: column.values.unwrap_or(&[]),
-                }
-            }),
+                }),
         );
-        model
+        (model, weights)
     }
 }
 
