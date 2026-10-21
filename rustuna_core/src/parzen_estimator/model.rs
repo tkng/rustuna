@@ -97,6 +97,7 @@ impl ParzenEstimator {
                     name: key.as_str(),
                     distribution: &search_space[key.as_str()],
                     values,
+                    categories: None,
                 }),
             scott,
             false,
@@ -140,6 +141,7 @@ impl ParzenEstimator {
                     name,
                     distribution: *distribution,
                     values,
+                    categories: None,
                 }),
             None,
             false,
@@ -346,6 +348,7 @@ mod tests {
                 name: "x",
                 distribution: &space,
                 values: &x_values,
+                categories: None,
             }],
         );
         let mut b = ParzenEstimator::default();
@@ -355,6 +358,7 @@ mod tests {
                 name: "y",
                 distribution: &space,
                 values: &y_values,
+                categories: None,
             }],
         );
         assert!(a.shares_state_with(&b));
@@ -370,6 +374,7 @@ mod tests {
                 name: "x",
                 distribution: &space,
                 values: &x_values,
+                categories: None,
             }],
         );
         // Equal contents but a private allocation, so not shared in the Arc sense.
@@ -444,6 +449,7 @@ mod tests {
                         name,
                         distribution,
                         values,
+                        categories: None,
                     }),
             );
             let fresh = ParzenEstimator::from_ordered_observations(

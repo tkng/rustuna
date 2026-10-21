@@ -247,6 +247,9 @@ pub struct ObservationColumn<'a> {
     pub name: &'a str,
     pub distribution: &'a crate::distribution::Distribution,
     pub values: &'a [f64],
+    /// Category indices when the column is stored as u32; preferred over
+    /// `values` for `Categorical` distributions.
+    pub categories: Option<&'a [u32]>,
 }
 
 /// Fixed-width bins over `(low, high]` tracking each bin's min/max extreme and
@@ -778,12 +781,15 @@ impl CategoricalDistributions {
     /// categories are kept or moved without re-reading the column.
     pub(crate) fn update_categories(
         &mut self,
-        values: &[f64],
+        column: &ObservationColumn,
         order: &[usize],
         update: &KernelUpdate,
         trusted: bool,
     ) {
-        let gather = |i: usize| values[order[i]] as u32;
+        let gather = |i: usize| match column.categories {
+            Some(categories) => categories[order[i]],
+            None => column.values[order[i]] as u32,
+        };
         let mut old = Vec::new();
         gather_column(
             &mut self.observed_categories,
@@ -866,12 +872,12 @@ impl Distributions {
             crate::distribution::Distribution::Categorical { cardinality } => {
                 match self {
                     Self::Categorical(d) if d.cardinality == *cardinality => {
-                        d.update_categories(column.values, order, update, trusted);
+                        d.update_categories(column, order, update, trusted);
                     }
                     _ => {
                         let mut d =
                             CategoricalDistributions::with_categories(Vec::new(), *cardinality);
-                        d.update_categories(column.values, order, update, false);
+                        d.update_categories(column, order, update, false);
                         *self = Self::Categorical(d);
                     }
                 }

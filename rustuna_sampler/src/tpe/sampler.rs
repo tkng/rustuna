@@ -321,10 +321,66 @@ struct TpeObservationSet {
 /// One parameter column with its presence bitmask.
 #[derive(Clone, Debug, PartialEq)]
 struct ParamColumnStore {
-    /// Present rows hold values; absent slots are NaN placeholders.
-    values: Vec<f64>,
+    /// Present rows hold values; absent slots are placeholders never read.
+    values: ParamValues,
     /// Bit `i` set iff `values[i]` is a present value.
     present: Vec<u64>,
+}
+
+/// Per-row parameter values; categorical columns keep category indices (u32),
+/// halving the snapshot array.
+#[derive(Clone, Debug, PartialEq)]
+enum ParamValues {
+    /// Absent slots are NaN placeholders.
+    Dense(Vec<f64>),
+    /// Absent slots are 0 placeholders.
+    Categorical(Vec<u32>),
+}
+
+impl ParamValues {
+    fn is_categorical(&self) -> bool {
+        matches!(self, Self::Categorical(_))
+    }
+
+    fn dense(&self) -> Option<&[f64]> {
+        match self {
+            Self::Dense(v) => Some(v),
+            Self::Categorical(_) => None,
+        }
+    }
+
+    fn categories(&self) -> Option<&[u32]> {
+        match self {
+            Self::Dense(_) => None,
+            Self::Categorical(v) => Some(v),
+        }
+    }
+
+    /// Inserts the placeholder for an unobserved row.
+    fn insert_row(&mut self, row: usize) {
+        match self {
+            Self::Dense(v) => v.insert(row, f64::NAN),
+            Self::Categorical(v) => v.insert(row, 0),
+        }
+    }
+
+    fn remove_row(&mut self, row: usize) {
+        match self {
+            Self::Dense(v) => {
+                v.remove(row);
+            }
+            Self::Categorical(v) => {
+                v.remove(row);
+            }
+        }
+    }
+
+    fn set(&mut self, row: usize, value: f64) {
+        match self {
+            Self::Dense(v) => v[row] = value,
+            Self::Categorical(v) => v[row] = value as u32,
+        }
+    }
 }
 
 fn bit_get(mask: &[u64], i: usize) -> bool {
@@ -403,6 +459,8 @@ struct TpeObservationColumn<'a> {
     name: &'a str,
     distribution: &'a Distribution,
     values: Option<&'a [f64]>,
+    /// Category indices for categorical columns stored as u32.
+    categories: Option<&'a [u32]>,
     present: Option<&'a [u64]>,
 }
 
@@ -428,6 +486,26 @@ impl TpeObservationSet {
         let constraints = trial.constraints()?;
         let feasible = constraints.values().all(|x| *x <= 0.0);
         let violation = constraints.values().filter(|&x| *x > 0.0).sum::<f64>();
+        // A parameter re-observed under a different distribution type cannot be
+        // recorded consistently; reject before mutating so a failed insert
+        // leaves the snapshot unchanged.
+        for name in trial.internal_params.keys() {
+            if self.param_columns.get(name).is_some_and(|c| {
+                c.values.is_categorical()
+                    != matches!(
+                        trial.distributions.get(name),
+                        Some(Distribution::Categorical { .. })
+                    )
+            }) {
+                return Err(Error::with_reason(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "Parameter \"{name}\" changes distribution type in trial {}",
+                        trial.number
+                    ),
+                ));
+            }
+        }
         let row = self
             .trial_numbers
             .partition_point(|&number| number < trial.number);
@@ -438,18 +516,26 @@ impl TpeObservationSet {
             values.iter().copied(),
         );
         for column in self.param_columns.values_mut() {
-            column.values.insert(row, f64::NAN);
+            column.values.insert_row(row);
             bit_insert(&mut column.present, row, false);
         }
         for (name, &value) in &trial.internal_params {
+            let categorical = matches!(
+                trial.distributions.get(name),
+                Some(Distribution::Categorical { .. })
+            );
             let column =
                 self.param_columns
                     .entry(name.clone())
                     .or_insert_with(|| ParamColumnStore {
-                        values: vec![f64::NAN; self.trial_numbers.len()],
+                        values: if categorical {
+                            ParamValues::Categorical(vec![0; self.trial_numbers.len()])
+                        } else {
+                            ParamValues::Dense(vec![f64::NAN; self.trial_numbers.len()])
+                        },
                         present: vec![0; self.trial_numbers.len().div_ceil(64)],
                     });
-            column.values[row] = value;
+            column.values.set(row, value);
             bit_set(&mut column.present, row, true);
         }
         self.feasibles_violations.insert(row, (feasible, violation));
@@ -464,7 +550,7 @@ impl TpeObservationSet {
                 .drain(row * self.n_objectives..(row + 1) * self.n_objectives);
             self.feasibles_violations.remove(row);
             self.param_columns.retain(|_, column| {
-                column.values.remove(row);
+                column.values.remove_row(row);
                 bit_remove(&mut column.present, row);
                 column.present.iter().any(|&w| w != 0)
             });
@@ -485,11 +571,17 @@ impl TpeObservationSet {
             param_columns: sorted_keys
                 .into_iter()
                 .map(|name| {
-                    let column = self.param_columns.get(name);
+                    // A column recorded under an incompatible distribution type
+                    // counts as unobserved for this ask.
+                    let column = self.param_columns.get(name).filter(|c| {
+                        c.values.is_categorical()
+                            == matches!(search_space[name], Distribution::Categorical { .. })
+                    });
                     TpeObservationColumn {
                         name,
                         distribution: &search_space[name],
-                        values: column.map(|c| c.values.as_slice()),
+                        values: column.and_then(|c| c.values.dense()),
+                        categories: column.and_then(|c| c.values.categories()),
                         present: column.map(|c| c.present.as_slice()),
                     }
                 })
@@ -1005,6 +1097,7 @@ impl TpeSampler {
                     name: column.name,
                     distribution: column.distribution,
                     values: column.values.unwrap_or(&[]),
+                    categories: column.categories,
                 }),
         );
         (model, weights)
@@ -1247,12 +1340,13 @@ mod tests {
         study
             .optimize(
                 |mut trial| {
-                    // x and z are observed every trial; y only on trial 1.
+                    // x and z are observed every trial; y only on trial 1,
+                    // through a categorical column stored as u32.
                     let x = trial.suggest_float("x", 0.0, 1.0)?;
                     let z = trial.suggest_float("z", 0.0, 1.0)?;
                     let mut value = x + z;
                     if trial.number == 1 {
-                        value += trial.suggest_float("y", 0.0, 1.0)?;
+                        value += *trial.suggest_categorical("y", &[0.0, 1.0])?;
                     }
                     Ok(vec![value])
                 },
@@ -1267,9 +1361,14 @@ mod tests {
             trial_id: 999,
         };
         let distribution = Distribution::new_float(0.0, 1.0, None, false);
-        for name in ["x", "y", "z"] {
+        let categorical = Distribution::new_categorical(2);
+        for (name, distribution) in [
+            ("x", &distribution),
+            ("y", &categorical),
+            ("z", &distribution),
+        ] {
             let value = sampler
-                .sample_independent(&ctx, study.storage.clone(), name, &distribution)
+                .sample_independent(&ctx, study.storage.clone(), name, distribution)
                 .unwrap();
             assert!((0.0..=1.0).contains(&value));
         }
@@ -1292,6 +1391,53 @@ mod tests {
         assert!(y.poor.component_count() < x.poor.component_count());
         // Four groups: {x,z}-good, y-good, {x,z}-poor, y-poor.
         assert_eq!(estimators.shared.len(), 4);
+        drop(cache);
+
+        // Asking the categorical column under a float distribution reads it
+        // as unobserved instead of reinterpreting category indices.
+        let value = sampler
+            .sample_independent(&ctx, study.storage.clone(), "y", &distribution)
+            .unwrap();
+        assert!((0.0..=1.0).contains(&value));
+    }
+
+    /// A parameter that changes distribution type across trials cannot be
+    /// recorded consistently and fails the history update loudly.
+    #[test]
+    fn parameter_columns_reject_distribution_type_changes() {
+        let mut set = TpeObservationSet {
+            version: 0,
+            trial_numbers: Vec::new(),
+            values: Vec::new(),
+            n_objectives: 1,
+            param_columns: HashMap::new(),
+            feasibles_violations: Vec::new(),
+        };
+        let trial = |number, value, distribution: Distribution| PersistedTrial {
+            state_values: TrialStateValues::Complete(vec![0.0]),
+            internal_params: HashMap::from([("x".to_string(), value)]),
+            distributions: HashMap::from([("x".to_string(), distribution)]),
+            ..PersistedTrial::new(number, 0, number)
+        };
+        set.insert(&trial(0, 0.0, Distribution::new_categorical(2)))
+            .unwrap();
+        assert!(set
+            .insert(&trial(
+                1,
+                0.5,
+                Distribution::new_float(0.0, 1.0, None, false)
+            ))
+            .is_err());
+        // The rejected insert left no partial row behind.
+        assert_eq!(set.trial_numbers, [0]);
+        // A same-type trial still inserts fine.
+        set.insert(&trial(1, 1.0, Distribution::new_categorical(2)))
+            .unwrap();
+        assert_eq!(set.trial_numbers, [0, 1]);
+        assert_eq!(
+            set.param_columns["x"].values,
+            ParamValues::Categorical(vec![0, 1])
+        );
     }
 
     #[test]
@@ -2153,9 +2299,15 @@ mod tests {
             .unwrap();
         assert_eq!(history.observations.trial_numbers, [0, 1]);
         assert_eq!(history.observations.values, [1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(history.observations.param_columns["x"].values, [0.1, 0.2]);
-        assert_eq!(history.observations.param_columns["y"].values[1], 0.8);
-        assert!(history.observations.param_columns["y"].values[0].is_nan());
+        assert_eq!(
+            history.observations.param_columns["x"].values,
+            ParamValues::Dense(vec![0.1, 0.2])
+        );
+        let ParamValues::Dense(y_values) = &history.observations.param_columns["y"].values else {
+            unreachable!()
+        };
+        assert_eq!(y_values[1], 0.8);
+        assert!(y_values[0].is_nan());
         assert_eq!(history.observations.param_columns["y"].present, [0b10]);
         assert_eq!(
             history.observations.feasibles_violations,

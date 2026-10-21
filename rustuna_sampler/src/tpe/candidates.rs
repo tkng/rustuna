@@ -72,6 +72,7 @@ mod tests {
                             name: names[p],
                             distribution: &distributions[p],
                             values: &columns[p],
+                            categories: None,
                         }),
                     );
                     let mut rng = StdRng::seed_from_u64(seed);
