@@ -117,15 +117,18 @@ impl Hash for StorageKey {
 
 #[derive(Default)]
 struct ObservationsCache {
-    per_trial: HashMap<(StorageKey, u32, u32), Option<Arc<TpeObservationSet>>>,
+    /// Snapshots served by `before_trial`, held weakly so an abandoned ask
+    /// cannot pin an observation-set generation; `after_trial` consumes the
+    /// entry so interleaved trials do not consume each other's data.
+    per_trial: HashMap<(StorageKey, u32, u32), Option<Weak<TpeObservationSet>>>,
     studies: HashMap<(StorageKey, u32), StudyObservations>,
-    next_use: u64,
 }
 
 struct StudyObservations {
     seen: Vec<Option<(u32, u32, TrialState)>>,
     observations: Arc<TpeObservationSet>,
-    last_used: u64,
+    /// Models fitted at the latest ask are reused to fit the next one
+    /// incrementally, preserving Optuna's seeded component draw order.
     estimators: StudyEstimators,
 }
 
@@ -253,7 +256,6 @@ impl StudyObservations {
                 param_columns: HashMap::new(),
                 feasibles_violations: Vec::new(),
             }),
-            last_used: 0,
             estimators: StudyEstimators::default(),
         }
     }
@@ -290,10 +292,6 @@ impl StudyObservations {
         Ok(())
     }
 }
-
-/// Upper bound on cached per-trial snapshots; trials returned from `ask` that
-/// never reach `tell` would otherwise leak their entry.
-const OBSERVATIONS_CACHE_CAP: usize = 64;
 
 /// Owned, columnar snapshot of the usable completed trials, copied out of the
 /// storage so the storage guard can be dropped before the TPE model is built.
@@ -960,36 +958,24 @@ impl TpeSampler {
         cache
             .studies
             .retain(|(owner, _), _| owner.0.strong_count() > 0);
-        cache
-            .per_trial
-            .retain(|(owner, _, _), _| owner.0.strong_count() > 0);
+        cache.per_trial.retain(|(owner, _, _), snapshot| {
+            owner.0.strong_count() > 0
+                && snapshot.as_ref().is_none_or(|weak| weak.strong_count() > 0)
+        });
         let key = (StorageKey(Arc::downgrade(storage)), ctx.study_id);
-        cache.next_use = cache.next_use.wrapping_add(1);
-        let last_used = cache.next_use;
         let history = cache
             .studies
             .entry(key.clone())
             .or_insert_with(|| StudyObservations::new(ctx.directions.len()));
         if let Err(error) = history.update(trials) {
             // Failed updates can leave partial observations. Drop the history so
-            // errors cannot bypass eviction and accumulate unbounded entries.
+            // the next sample rebuilds it cleanly instead of reusing a poisoned
+            // entry.
             cache.studies.remove(&key);
             return Err(error);
         }
-        history.last_used = last_used;
         let snapshot = (history.observations.trial_numbers.len() >= self.n_startup_trials)
             .then(|| Arc::clone(&history.observations));
-        if cache.studies.len() > OBSERVATIONS_CACHE_CAP {
-            let oldest = cache
-                .studies
-                .iter()
-                .filter(|(candidate, _)| **candidate != key)
-                .min_by_key(|(_, history)| history.last_used)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                cache.studies.remove(&oldest);
-            }
-        }
         Ok(snapshot)
     }
 
@@ -1017,9 +1003,14 @@ impl TpeSampler {
                 ctx.trial_id,
             ))
             .cloned();
-        match cached {
-            Some(observations) => Ok(observations),
-            None => self.snapshot_from_storage(ctx, storage),
+        match cached.map(|entry| entry.map(|weak| weak.upgrade())) {
+            // The weak snapshot resolves to the history's current generation.
+            Some(Some(Some(observations))) => Ok(Some(observations)),
+            // A cached `None` means too few usable trials at `before_trial`.
+            Some(None) => Ok(None),
+            // No cached entry, or the history behind the weak snapshot was
+            // dropped: rebuild the snapshot from storage.
+            _ => self.snapshot_from_storage(ctx, storage),
         }
     }
 
@@ -1153,20 +1144,8 @@ impl Sampler for TpeSampler {
                 ctx.study_id,
                 ctx.trial_id,
             ),
-            observations,
+            observations.map(|observations| Arc::downgrade(&observations)),
         );
-        // Trial ids grow monotonically, so the smallest id is the oldest entry.
-        while cache.per_trial.len() > OBSERVATIONS_CACHE_CAP {
-            let Some(oldest) = cache
-                .per_trial
-                .keys()
-                .min_by_key(|(_, _, trial_id)| *trial_id)
-                .cloned()
-            else {
-                break;
-            };
-            cache.per_trial.remove(&oldest);
-        }
         Ok(())
     }
 
@@ -2163,18 +2142,17 @@ mod tests {
             .per_trial
             .contains_key(&key(101)));
 
-        for trial_id in 200..(200 + OBSERVATIONS_CACHE_CAP as u32 + 5) {
+        for trial_id in 200..210 {
             probe
                 .before_trial(&ctx(trial_id), study.storage.clone())
                 .unwrap();
         }
         let cache = probe.observations_cache.read().unwrap();
-        assert_eq!(cache.per_trial.len(), OBSERVATIONS_CACHE_CAP);
-        // The oldest entries (smallest trial ids) were evicted first.
-        assert!(!cache.per_trial.contains_key(&key(100)));
-        assert!(cache
-            .per_trial
-            .contains_key(&key(200 + OBSERVATIONS_CACHE_CAP as u32 + 4)));
+        // Pending asks are kept without a cap; the abandoned ask at 100 still
+        // resolves to the current generation via its weak snapshot.
+        assert_eq!(cache.per_trial.len(), 1 + 10);
+        assert!(cache.per_trial.contains_key(&key(100)));
+        assert!(cache.per_trial.contains_key(&key(209)));
     }
 
     #[test]
@@ -2438,33 +2416,45 @@ mod tests {
     }
 
     #[test]
-    fn retained_study_histories_have_a_bounded_capacity() {
+    fn retained_study_histories_follow_their_storage_lifetime() {
         let storage: Arc<RwLock<dyn Storage>> = Arc::new(RwLock::new(InMemoryStorage::new()));
         let sampler = TpeBuilder::new().n_startup_trials(0).build();
-        for index in 0..OBSERVATIONS_CACHE_CAP + 5 {
+        let ctx = |study_id| Context {
+            study_id,
+            trial_id: study_id,
+            trial_number: 0,
+            directions: vec![Direction::Minimize],
+        };
+        let n_studies = 8;
+        for index in 0..n_studies {
             let study_id = storage
                 .write()
                 .unwrap()
-                .create_new_study(&format!("bounded-{index}"), vec![Direction::Minimize])
+                .create_new_study(&format!("kept-{index}"), vec![Direction::Minimize])
                 .unwrap()
                 .id;
-            let ctx = Context {
-                study_id,
-                trial_id: study_id,
-                trial_number: 0,
-                directions: vec![Direction::Minimize],
-            };
-            sampler.before_trial(&ctx, storage.clone()).unwrap();
+            sampler
+                .before_trial(&ctx(study_id), storage.clone())
+                .unwrap();
         }
         let cache = sampler.observations_cache.read().unwrap();
-        assert_eq!(cache.studies.len(), OBSERVATIONS_CACHE_CAP);
-        assert_eq!(cache.per_trial.len(), OBSERVATIONS_CACHE_CAP);
-        assert!(!cache
+        // Every study the storage still hosts keeps its history.
+        assert_eq!(cache.studies.len(), n_studies);
+        assert_eq!(cache.per_trial.len(), n_studies);
+        drop(cache);
+        // Once the storage is gone, the next snapshot sweeps its entries.
+        drop(storage);
+        let fresh: Arc<RwLock<dyn Storage>> = Arc::new(RwLock::new(InMemoryStorage::new()));
+        fresh
+            .write()
+            .unwrap()
+            .create_new_study("fresh", vec![Direction::Minimize])
+            .unwrap();
+        sampler.before_trial(&ctx(0), fresh.clone()).unwrap();
+        let cache = sampler.observations_cache.read().unwrap();
+        assert!(cache
             .studies
-            .contains_key(&(StorageKey(Arc::downgrade(&storage)), 0)));
-        assert!(cache.studies.contains_key(&(
-            StorageKey(Arc::downgrade(&storage)),
-            (OBSERVATIONS_CACHE_CAP + 4) as u32
-        )));
+            .keys()
+            .all(|(owner, _)| owner.0.upgrade().is_some()));
     }
 }
