@@ -3,6 +3,7 @@ use super::truncnorm;
 use rand::rngs::StdRng;
 use rand::Rng;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::truncnorm::NEG_HALF_LOG_2PI;
 
@@ -1019,7 +1020,7 @@ impl Distributions {
 pub(crate) struct MixtureOfProductDistribution {
     pub param_names: Vec<String>,          // Sorted param names
     pub distributions: Vec<Distributions>, // Sorted distributions
-    pub log_weights: Vec<f64>,             // ln(w_i)
+    pub log_weights: Arc<[f64]>,           // ln(w_i)
     pub log_sum_weights: f64,              // ln(sum weights)
     pub n_kernels: usize,
 }
@@ -1030,7 +1031,7 @@ impl MixtureOfProductDistribution {
         let mut mixture = Self {
             param_names,
             distributions,
-            log_weights: Vec::new(),
+            log_weights: Vec::new().into(),
             log_sum_weights: 0.0,
             n_kernels: 0,
         };

@@ -7,7 +7,9 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rustuna_core::distribution::Distribution;
 use rustuna_core::internal::multi_objective;
-use rustuna_core::internal::parzen_estimator::{set_bits, ObservationColumn, ParzenEstimator};
+use rustuna_core::internal::parzen_estimator::{
+    set_bits, ObservationColumn, ParzenEstimator, SharedState,
+};
 use rustuna_core::sampler::{Context, RandomSampler, Sampler};
 use rustuna_core::storage::Storage;
 use rustuna_core::study::Direction;
@@ -138,6 +140,15 @@ struct CachedEstimators {
     poor: ParzenEstimator,
 }
 
+/// Key identifying one shared model update: `(observation-set version,
+/// recency_ramp, split rows_mask, parameter active mask)`. These fully
+/// determine the order, IDs and weights a model would compute, so a pooled
+/// entry is an interchangeable [`SharedState`] with no content comparison
+/// needed. Parameters with different missing-value patterns select different
+/// `active` rows and never share.
+type SharedKey = (u64, bool, Vec<u64>, Vec<u64>);
+type SharedPool = HashMap<SharedKey, Arc<SharedState>>;
+
 /// Models belong to the same storage/study as their observation history. Keep
 /// one current joint space and the independent parameters used by the latest
 /// trial, rather than retaining a fixed number of historical search spaces.
@@ -146,6 +157,9 @@ struct StudyEstimators {
     trial_id: Option<u32>,
     joint: Option<(Vec<String>, CachedEstimators)>,
     independent: HashMap<String, CachedEstimators>,
+    /// Observation IDs and weights shared by models fitted on identical rows.
+    /// Scoped to the current trial and the observation-set generation.
+    shared: SharedPool,
 }
 
 impl StudyEstimators {
@@ -214,6 +228,15 @@ impl StudyEstimators {
             }
             self.independent
                 .retain(|_, cached| cached.trial_id == trial_id);
+            self.shared.clear();
+        }
+    }
+
+    /// Returns shared state produced while sampling. Entries under the same
+    /// key are interchangeable, so a plain `extend` cannot go wrong.
+    fn restore_shared(&mut self, trial_id: u32, shared: SharedPool) {
+        if self.trial_id == Some(trial_id) {
+            self.shared.extend(shared);
         }
     }
 }
@@ -223,6 +246,7 @@ impl StudyObservations {
         Self {
             seen: Vec::new(),
             observations: Arc::new(TpeObservationSet {
+                version: 0,
                 trial_numbers: Vec::new(),
                 values: Vec::new(),
                 n_objectives,
@@ -279,6 +303,9 @@ const OBSERVATIONS_CACHE_CAP: usize = 64;
 /// serves every suggestion of that trial.
 #[derive(Clone)]
 struct TpeObservationSet {
+    /// Bumped on every insert/remove; identifies this snapshot generation so
+    /// shared model state can key on it instead of comparing contents.
+    version: u64,
     trial_numbers: Vec<u32>,
     /// Objective values, `n_objectives` slots per row.
     values: Vec<f64>,
@@ -363,6 +390,8 @@ fn bit_remove(mask: &mut Vec<u64>, pos: usize) {
 /// `param_columns` is in sorted-key order of the search space; `None` marks a
 /// parameter that no trial in the snapshot observed.
 struct TpeObservationsView<'a> {
+    /// Generation of the observed set; equal versions imply identical rows.
+    version: u64,
     trial_numbers: &'a [u32],
     values: &'a [f64],
     n_objectives: usize,
@@ -402,6 +431,7 @@ impl TpeObservationSet {
         let row = self
             .trial_numbers
             .partition_point(|&number| number < trial.number);
+        self.version += 1;
         self.trial_numbers.insert(row, trial.number);
         self.values.splice(
             row * self.n_objectives..row * self.n_objectives,
@@ -428,6 +458,7 @@ impl TpeObservationSet {
 
     fn remove(&mut self, number: u32) {
         if let Ok(row) = self.trial_numbers.binary_search(&number) {
+            self.version += 1;
             self.trial_numbers.remove(row);
             self.values
                 .drain(row * self.n_objectives..(row + 1) * self.n_objectives);
@@ -447,6 +478,7 @@ impl TpeObservationSet {
         let mut sorted_keys: Vec<&String> = search_space.keys().collect();
         sorted_keys.sort();
         TpeObservationsView {
+            version: self.version,
             trial_numbers: &self.trial_numbers,
             values: &self.values,
             n_objectives: self.n_objectives,
@@ -642,18 +674,21 @@ impl TpeSampler {
         };
 
         let study_key = (StorageKey(Arc::downgrade(storage)), ctx.study_id);
-        let previous = self
-            .observations_cache
-            .write()
-            .map_err(|e| {
+        let (previous, mut shared) = {
+            let mut cache = self.observations_cache.write().map_err(|e| {
                 Error::with_reason(
                     ErrorKind::SamplerError,
                     format!("Failed to acquire observations cache guard: {e}"),
                 )
-            })?
-            .studies
-            .get_mut(&study_key)
-            .and_then(|history| history.estimators.take(ctx.trial_id, &cache_key));
+            })?;
+            match cache.studies.get_mut(&study_key) {
+                Some(history) => (
+                    history.estimators.take(ctx.trial_id, &cache_key),
+                    std::mem::take(&mut history.estimators.shared),
+                ),
+                None => (None, SharedPool::new()),
+            }
+        };
         let (previous_good, previous_poor) = previous
             .map(|(good, poor)| (Some(good), Some(poor)))
             .unwrap_or_default();
@@ -662,8 +697,15 @@ impl TpeSampler {
             &good_rows,
             good_recency_ramp,
             previous_good,
+            &mut shared,
         );
-        let (poor, _) = Self::build_parzen_estimator(observations, &poor_rows, true, previous_poor);
+        let (poor, _) = Self::build_parzen_estimator(
+            observations,
+            &poor_rows,
+            true,
+            previous_poor,
+            &mut shared,
+        );
 
         assert_eq!(good.parameter_names(), poor.parameter_names());
         let n_ei_candidates = 24;
@@ -682,7 +724,7 @@ impl TpeSampler {
             })?;
             candidates::generate_candidates(
                 &good,
-                good_weights,
+                &good_weights,
                 &mut rng,
                 n_ei_candidates,
                 &mut scratch,
@@ -707,6 +749,7 @@ impl TpeSampler {
             history
                 .estimators
                 .insert(ctx.trial_id, cache_key, good, poor);
+            history.estimators.restore_shared(ctx.trial_id, shared);
         }
         Ok(result)
     }
@@ -921,7 +964,8 @@ impl TpeSampler {
         rows: &[usize],
         recency_ramp: bool,
         previous: Option<ParzenEstimator>,
-    ) -> (ParzenEstimator, Vec<f64>) {
+        shared: &mut SharedPool,
+    ) -> (ParzenEstimator, Arc<[f64]>) {
         let n_trials = rows.len();
         let n_rows = observations.len();
         let n_words = n_rows.div_ceil(64);
@@ -946,31 +990,14 @@ impl TpeSampler {
             }
         }
 
-        // Optuna: single-objective uses the recency ramp (`default_weights`) for both the
-        // below (`l(x)`) and above (`g(x)`) estimators; multi-objective uses uniform weights
-        // for the below estimator and the recency ramp for the above estimator.
-        let weights = if recency_ramp {
-            Self::weights_for_single_objective(n_trials)
-        } else {
-            vec![1.0; n_trials]
-        };
-        let prior_weight = 1.0;
-        let mut order = Vec::new();
-        let mut active_weights = Vec::new();
-        let mut ids = Vec::new();
-        for (rank, row) in set_bits(&rows_mask).enumerate() {
-            if bit_get(&active, row) {
-                order.push(row);
-                active_weights.push(weights[rank]);
-                ids.push(observations.trial_numbers[row]);
-            }
-        }
+        let key = (observations.version, recency_ramp, rows_mask, active);
+        let state = shared
+            .entry(key)
+            .or_insert_with_key(|key| Arc::new(Self::shared_state(observations, key, n_trials)))
+            .clone();
         let mut model = previous.unwrap_or_default();
-        let weights = model.update(
-            &order,
-            ids,
-            &active_weights,
-            prior_weight,
+        let weights = model.update_shared(
+            &state,
             observations
                 .param_columns
                 .iter()
@@ -981,6 +1008,34 @@ impl TpeSampler {
                 }),
         );
         (model, weights)
+    }
+
+    /// The [`SharedState`] one update would install for `key`'s row selection.
+    fn shared_state(
+        observations: &TpeObservationsView<'_>,
+        key: &SharedKey,
+        n_trials: usize,
+    ) -> SharedState {
+        let (_, recency_ramp, rows_mask, active) = key;
+        // Optuna: single-objective uses the recency ramp (`default_weights`) for both the
+        // below (`l(x)`) and above (`g(x)`) estimators; multi-objective uses uniform weights
+        // for the below estimator and the recency ramp for the above estimator.
+        let weights = if *recency_ramp {
+            Self::weights_for_single_objective(n_trials)
+        } else {
+            vec![1.0; n_trials]
+        };
+        let mut order = Vec::new();
+        let mut active_weights = Vec::new();
+        let mut ids = Vec::new();
+        for (rank, row) in set_bits(rows_mask).enumerate() {
+            if bit_get(active, row) {
+                order.push(row);
+                active_weights.push(weights[rank]);
+                ids.push(observations.trial_numbers[row]);
+            }
+        }
+        SharedState::new(&order, &ids, &active_weights, 1.0)
     }
 }
 
@@ -1181,6 +1236,62 @@ mod tests {
             .estimators
             .independent
             .is_empty());
+    }
+
+    /// Parameters observed on the same rows share their observation IDs and
+    /// weights; a parameter with a different missing-value pattern keeps its
+    /// own state and sees strictly the rows it was observed on.
+    #[test]
+    fn independent_models_share_state_only_when_presence_masks_match() {
+        let (study, sampler) = study_with_shared_sampler(false);
+        study
+            .optimize(
+                |mut trial| {
+                    // x and z are observed every trial; y only on trial 1.
+                    let x = trial.suggest_float("x", 0.0, 1.0)?;
+                    let z = trial.suggest_float("z", 0.0, 1.0)?;
+                    let mut value = x + z;
+                    if trial.number == 1 {
+                        value += trial.suggest_float("y", 0.0, 1.0)?;
+                    }
+                    Ok(vec![value])
+                },
+                6,
+            )
+            .unwrap();
+
+        let ctx = Context {
+            study_id: study.id,
+            directions: vec![Direction::Minimize],
+            trial_number: 6,
+            trial_id: 999,
+        };
+        let distribution = Distribution::new_float(0.0, 1.0, None, false);
+        for name in ["x", "y", "z"] {
+            let value = sampler
+                .sample_independent(&ctx, study.storage.clone(), name, &distribution)
+                .unwrap();
+            assert!((0.0..=1.0).contains(&value));
+        }
+
+        let key = (StorageKey(Arc::downgrade(&study.storage)), study.id);
+        let cache = sampler.observations_cache.read().unwrap();
+        let estimators = &cache.studies[&key].estimators;
+        let (x, y, z) = (
+            &estimators.independent["x"],
+            &estimators.independent["y"],
+            &estimators.independent["z"],
+        );
+        // Same presence mask over identical rows: one shared allocation.
+        assert!(x.good.shares_state_with(&z.good));
+        assert!(x.poor.shares_state_with(&z.poor));
+        // Different presence mask: separate state, and the missing rows are
+        // excluded rather than wrongly shared.
+        assert!(!x.good.shares_state_with(&y.good));
+        assert!(!x.poor.shares_state_with(&y.poor));
+        assert!(y.poor.component_count() < x.poor.component_count());
+        // Four groups: {x,z}-good, y-good, {x,z}-poor, y-poor.
+        assert_eq!(estimators.shared.len(), 4);
     }
 
     #[test]

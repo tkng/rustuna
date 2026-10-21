@@ -1,13 +1,14 @@
 use rand::rngs::StdRng;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::normalized_weights;
 #[cfg(test)]
 use super::probability_distributions::binned_sigmas;
 use super::probability_distributions::{
     BinState, Distributions, KernelUpdate, MixtureOfProductDistribution, NormalBuffers,
     ObservationColumn,
 };
+use super::SharedState;
 use crate::distribution::Distribution;
 use crate::parzen_estimator::scott::ScottNumericalDistributionBuilder;
 
@@ -15,7 +16,7 @@ use crate::parzen_estimator::scott::ScottNumericalDistributionBuilder;
 /// Retains density coefficients and update state, but no component-selection table.
 pub struct ParzenEstimator {
     mixuture_distribution: MixtureOfProductDistribution,
-    observation_ids: Vec<u32>,
+    observation_ids: Arc<[u32]>,
     bins: Vec<Option<BinState>>,
 }
 
@@ -23,7 +24,7 @@ impl Default for ParzenEstimator {
     fn default() -> Self {
         Self {
             mixuture_distribution: MixtureOfProductDistribution::new(Vec::new(), vec![1.0]),
-            observation_ids: Vec::new(),
+            observation_ids: Vec::new().into(),
             bins: Vec::new(),
         }
     }
@@ -86,12 +87,10 @@ impl ParzenEstimator {
             })
             .collect();
         let order: Vec<usize> = (0..n_observations).collect();
+        let ids: Vec<u32> = (0..n_observations as u32).collect();
         let mut model = Self::default();
         model.update_with(
-            &order,
-            (0..n_observations as u32).collect(),
-            weights,
-            prior_weight,
+            &SharedState::new(&order, &ids, weights, prior_weight),
             keys.iter()
                 .zip(&owned)
                 .map(|(key, values)| ObservationColumn {
@@ -134,10 +133,7 @@ impl ParzenEstimator {
         let order: Vec<usize> = (0..observation_ids.len()).collect();
         let mut model = previous.unwrap_or_default();
         model.update_with(
-            &order,
-            observation_ids,
-            weights,
-            prior_weight,
+            &SharedState::new(&order, &observation_ids, weights, prior_weight),
             owned
                 .iter()
                 .map(|(name, distribution, values)| ObservationColumn {
@@ -164,41 +160,54 @@ impl ParzenEstimator {
         weights: &[f64],
         prior_weight: f64,
         columns: I,
-    ) -> Vec<f64>
+    ) -> Arc<[f64]>
     where
         I: IntoIterator<Item = ObservationColumn<'a>>,
     {
-        self.update_with(
-            order,
-            observation_ids,
-            weights,
-            prior_weight,
+        self.update_shared(
+            &SharedState::new(order, &observation_ids, weights, prior_weight),
             columns,
-            None,
-            true,
         )
+    }
+
+    /// Like [`Self::update`], but adopts row positions, observation IDs and
+    /// density coefficients shared with other models. Models fitted on
+    /// identical rows and weights retain one allocation of the shared state
+    /// instead of one copy each. `shared` must describe the same rows and
+    /// weights this update would consume; callers establish that by sharing
+    /// only states built from identical inputs, e.g. parameters whose presence
+    /// masks select the same rows of an unchanged observation set.
+    #[doc(hidden)]
+    pub fn update_shared<'a, I>(&mut self, shared: &SharedState, columns: I) -> Arc<[f64]>
+    where
+        I: IntoIterator<Item = ObservationColumn<'a>>,
+    {
+        self.update_with(shared, columns, None, true)
+    }
+
+    /// Whether `self` and `other` hold the same shared state allocation, i.e.
+    /// both were updated with the same [`SharedState`] instance.
+    #[doc(hidden)]
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.observation_ids, &other.observation_ids)
+            && Arc::ptr_eq(
+                &self.mixuture_distribution.log_weights,
+                &other.mixuture_distribution.log_weights,
+            )
     }
 
     fn update_with<'a, I>(
         &mut self,
-        order: &[usize],
-        observation_ids: Vec<u32>,
-        weights: &[f64],
-        prior_weight: f64,
+        shared: &SharedState,
         columns: I,
         scott: Option<&ScottNumericalDistributionBuilder>,
         trusted: bool,
-    ) -> Vec<f64>
+    ) -> Arc<[f64]>
     where
         I: IntoIterator<Item = ObservationColumn<'a>>,
     {
-        assert_eq!(order.len(), observation_ids.len());
-        assert!(
-            observation_ids.windows(2).all(|ids| ids[0] < ids[1]),
-            "Observation IDs must be sorted and unique"
-        );
-        assert_eq!(weights.len(), observation_ids.len());
-        let update = KernelUpdate::between(&self.observation_ids, &observation_ids);
+        let order = &shared.order[..];
+        let update = KernelUpdate::between(&self.observation_ids, &shared.observation_ids);
         let m = &mut self.mixuture_distribution;
         let mut old = std::mem::take(&mut m.param_names)
             .into_iter()
@@ -256,13 +265,14 @@ impl ParzenEstimator {
             self.bins.push(bins);
         }
         assert!(
-            n_kernels.is_none_or(|k| k == observation_ids.len() + 1),
+            n_kernels.is_none_or(|k| k == shared.observation_ids.len() + 1),
             "Observation columns and weights differ in length"
         );
-        let weights = normalized_weights(weights, prior_weight);
-        m.set_weights(&weights);
-        self.observation_ids = observation_ids;
-        weights
+        m.log_weights = shared.log_weights.clone();
+        m.log_sum_weights = shared.log_sum_weights;
+        m.n_kernels = shared.weights.len();
+        self.observation_ids = shared.observation_ids.clone();
+        shared.weights.clone()
     }
 
     /// Parameter names in the order used by component draws and density values.
@@ -319,6 +329,67 @@ mod tests {
         let mut values = Vec::new();
         model.draw_component(rng, component, &mut values);
         values
+    }
+
+    /// Models updated through a [`SharedState`] reuse its allocation and behave
+    /// bit-for-bit like models built by [`ParzenEstimator::update`].
+    #[test]
+    fn shared_updates_match_plain_updates_bit_for_bit() {
+        let space = Distribution::new_float(-5.0, 5.0, None, false);
+        let x_values = [0.1, 0.2, 0.4];
+        let y_values = [4.0, -2.0, 0.0];
+        let shared = SharedState::new(&[0, 1, 2], &[10, 20, 30], &[1.0, 2.0, 1.0], 1.0);
+        let mut a = ParzenEstimator::default();
+        let a_weights = a.update_shared(
+            &shared,
+            [ObservationColumn {
+                name: "x",
+                distribution: &space,
+                values: &x_values,
+            }],
+        );
+        let mut b = ParzenEstimator::default();
+        b.update_shared(
+            &shared,
+            [ObservationColumn {
+                name: "y",
+                distribution: &space,
+                values: &y_values,
+            }],
+        );
+        assert!(a.shares_state_with(&b));
+        assert_eq!(a_weights[..], shared.weights[..]);
+
+        let mut plain = ParzenEstimator::default();
+        let plain_weights = plain.update(
+            &[0, 1, 2],
+            vec![10, 20, 30],
+            &[1.0, 2.0, 1.0],
+            1.0,
+            [ObservationColumn {
+                name: "x",
+                distribution: &space,
+                values: &x_values,
+            }],
+        );
+        // Equal contents but a private allocation, so not shared in the Arc sense.
+        assert!(!a.shares_state_with(&plain));
+        assert_eq!(a_weights[..], plain_weights[..]);
+        assert_eq!(a.parameter_names(), plain.parameter_names());
+        for x in [-4.5, 0.0, 0.25, 3.3] {
+            assert_eq!(
+                a.log_pdf_ordered(&[x]).to_bits(),
+                plain.log_pdf_ordered(&[x]).to_bits()
+            );
+        }
+        let (mut rng_a, mut rng_b) = (StdRng::seed_from_u64(7), StdRng::seed_from_u64(7));
+        for k in 0..a.component_count() {
+            assert_eq!(
+                draw(&a, &mut rng_a, k),
+                draw(&plain, &mut rng_b, k),
+                "component {k}"
+            );
+        }
     }
 
     /// Repeated `update` calls after `mutate` must match a fresh rebuild

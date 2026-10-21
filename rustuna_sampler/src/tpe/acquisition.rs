@@ -76,7 +76,7 @@ mod tests {
                 let mut samples = Vec::new();
                 generate_candidates(
                     &good,
-                    normalized_weights(&[1.0; 3], 1.0),
+                    &normalized_weights(&[1.0; 3], 1.0),
                     &mut StdRng::seed_from_u64(42),
                     24,
                     &mut samples,

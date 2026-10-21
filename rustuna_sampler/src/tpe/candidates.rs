@@ -7,14 +7,14 @@ use rustuna_core::internal::parzen_estimator::ParzenEstimator;
 /// the selection table exists only for this call and the model retains no sampling state.
 pub(super) fn generate_candidates(
     model: &ParzenEstimator,
-    weights: Vec<f64>,
+    weights: &[f64],
     rng: &mut StdRng,
     size: usize,
     samples: &mut Vec<Vec<f64>>,
 ) {
     assert_eq!(model.component_count(), weights.len());
     samples.resize_with(size, Vec::new);
-    let selection = WeightedAliasIndex::new(weights)
+    let selection = WeightedAliasIndex::new(weights.to_vec())
         .expect("mixture weights are validated before candidate generation");
     for sample in samples {
         let component = selection.sample(rng);
@@ -76,7 +76,7 @@ mod tests {
                     );
                     let mut rng = StdRng::seed_from_u64(seed);
                     let mut samples = Vec::new();
-                    generate_candidates(&model, weights, &mut rng, 48, &mut samples);
+                    generate_candidates(&model, &weights, &mut rng, 48, &mut samples);
                     let hash = samples
                         .iter()
                         .flatten()
@@ -135,21 +135,21 @@ mod tests {
         let model = correlated_categorical_model();
         let mut samples = Vec::new();
         let mut rng = StdRng::seed_from_u64(42);
-        generate_candidates(&model, weights(), &mut rng, 6, &mut samples);
+        generate_candidates(&model, &weights(), &mut rng, 6, &mut samples);
         let first_two = samples[..2].to_vec();
         let pointers: Vec<_> = samples[..2].iter().map(|row| row.as_ptr()).collect();
         let mut rng = StdRng::seed_from_u64(42);
-        generate_candidates(&model, weights(), &mut rng, 2, &mut samples);
+        generate_candidates(&model, &weights(), &mut rng, 2, &mut samples);
         assert_eq!(samples, first_two);
         assert_eq!(
             samples.iter().map(|row| row.as_ptr()).collect::<Vec<_>>(),
             pointers
         );
         let mut untouched_rng = rng.clone();
-        generate_candidates(&model, weights(), &mut rng, 0, &mut samples);
+        generate_candidates(&model, &weights(), &mut rng, 0, &mut samples);
         assert!(samples.is_empty());
         assert_eq!(rng.next_u64(), untouched_rng.next_u64());
-        generate_candidates(&model, weights(), &mut rng, 9, &mut samples);
+        generate_candidates(&model, &weights(), &mut rng, 9, &mut samples);
         assert_eq!(samples.len(), 9);
         assert!(samples
             .iter()
@@ -162,7 +162,7 @@ mod tests {
         let mut samples = Vec::new();
         generate_candidates(
             &model,
-            weights(),
+            &weights(),
             &mut StdRng::seed_from_u64(42),
             20_000,
             &mut samples,
